@@ -423,28 +423,67 @@ impl ConnectionHandler {
 
 ### Backpressure Handling
 
-When the queue is full (extremely rare with 4096 capacity):
+When the queue is full (extremely rare with 4096 capacity), use **retry with exponential backoff**:
 
 ```rust
-// Option 1: Drop command (lossy, fast)
-if queue.push(cmd).is_err() {
-    tracing::warn!("Queue full, dropping command");
-}
+// ingest/queue.rs
+impl CommandQueue {
+    /// Push with retry and exponential backoff
+    /// Returns Ok(()) on success, Err after max retries
+    pub fn push_with_retry(&self, cmd: PendingCommand, max_retries: u32) -> Result<(), PendingCommand> {
+        let mut cmd = cmd;
 
-// Option 2: Inline write (blocking, reliable)
-if queue.push(cmd).is_err() {
-    tracing::warn!("Queue full, falling back to sync write");
-    direct_write_to_db(&cmd);
-}
+        for attempt in 0..max_retries {
+            match self.queue.push(cmd) {
+                Ok(()) => {
+                    self.pending_count.fetch_add(1, Ordering::Relaxed);
+                    if attempt > 0 {
+                        tracing::debug!("Queue push succeeded after {} retries", attempt);
+                    }
+                    return Ok(());
+                }
+                Err(returned) => {
+                    cmd = returned;
+                    if attempt < max_retries - 1 {
+                        // Exponential backoff: 100μs, 200μs, 400μs
+                        let delay = Duration::from_micros(100 << attempt);
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
 
-// Option 3: Retry with backoff (balanced)
-for attempt in 0..3 {
-    if queue.push(cmd.clone()).is_ok() {
-        break;
+        tracing::warn!("Queue full after {} retries, command may be lost", max_retries);
+        Err(cmd)
     }
-    std::thread::sleep(Duration::from_micros(100 << attempt));
+}
+
+// daemon/handler.rs - Usage
+impl ConnectionHandler {
+    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+        let cmd = PendingCommand { /* ... */ };
+
+        // Retry up to 3 times with backoff (100μs, 200μs, 400μs)
+        match self.queue.push_with_retry(cmd, 3) {
+            Ok(()) => Response::Accepted,
+            Err(_) => {
+                // Final fallback: metrics + error response
+                metrics::counter!("histdb.queue.drops").increment(1);
+                Response::QueueFull
+            }
+        }
+    }
 }
 ```
+
+**Backoff schedule:**
+| Attempt | Delay | Cumulative |
+|---------|-------|------------|
+| 1 | 100μs | 100μs |
+| 2 | 200μs | 300μs |
+| 3 | 400μs | 700μs |
+
+This keeps total worst-case latency under 1ms while giving the writer thread time to drain.
 
 ### Query Consistency
 
@@ -1566,7 +1605,7 @@ Real-time, offline-first synchronization using **sqlsync** for CRDT-based SQLite
 | Consistency | Eventual | Eventual | **Strong eventual** |
 | Complexity | Low | Medium | Medium |
 
-### Architecture Overview
+### Architecture Overview (P2P Primary)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1582,21 +1621,27 @@ Real-time, offline-first synchronization using **sqlsync** for CRDT-based SQLite
 │                           │                                         │
 └───────────────────────────┼─────────────────────────────────────────┘
                             │
-                            │ WebSocket / HTTP
-                            │ (CRDT sync messages)
-                            ▼
-                   ┌─────────────────┐
-                   │   Sync Server   │  (Optional: can be P2P)
-                   │   (Coordinator) │
-                   └────────┬────────┘
+                            │ P2P (libp2p / QUIC)
+                            │ Direct machine-to-machine
                             │
 ┌───────────────────────────┼─────────────────────────────────────────┐
 │                           │                                         │
 │  ┌─────────────┐    ┌─────▼───────┐    ┌─────────────────────────┐ │
 │  │   Shells    │───▶│   Daemon    │───▶│  Local SQLite + sqlsync │ │
-│  └─────────────┘    └─────────────┘    └─────────────────────────┘ │
+│  └─────────────┘    │             │    │  (CRDT operations)      │ │
+│                     │  ┌────────┐ │    └───────────┬─────────────┘ │
+│                     │  │ Sync   │ │                │               │
+│                     │  │ Worker │◀┼────────────────┘               │
+│                     │  └────────┘ │                                │
+│                     └─────────────┘                                 │
 │                         Machine B                                    │
 └─────────────────────────────────────────────────────────────────────┘
+
+Optional: Bootstrap/Relay Server (for NAT traversal)
+┌─────────────────┐
+│  Signaling Hub  │  Only for peer discovery & NAT hole-punching
+│  (lightweight)  │  No data storage, no single point of failure
+└─────────────────┘
 ```
 
 ### sqlsync Integration
@@ -1859,24 +1904,173 @@ impl WriterThread {
 
 [sync]
 enabled = true
-# Coordinator URL (optional - can run P2P only)
-coordinator_url = "https://histdb-sync.example.com"
 # Sync interval in seconds
 interval_secs = 5
-# Peer ID (auto-generated if not set)
+# Peer ID (auto-generated if not set, persisted in DB)
 peer_id = "machine-a-uuid"
 
 [sync.p2p]
-enabled = false  # Future: direct P2P sync
-listen_port = 4242
+enabled = true
+# Listen address for incoming peer connections
+listen_addr = "/ip4/0.0.0.0/tcp/4242"
+# Known peers (can also be discovered via mDNS)
+bootstrap_peers = [
+    "/ip4/192.168.1.100/tcp/4242/p2p/QmPeer1...",
+    "/ip4/192.168.1.101/tcp/4242/p2p/QmPeer2...",
+]
+# Enable mDNS for automatic LAN discovery
+mdns_enabled = true
+# Optional: signaling server for NAT traversal
+signaling_url = "https://histdb-signal.example.com"  # Optional
+
+[sync.p2p.limits]
+max_peers = 10
+max_pending_mutations = 10000
+```
+
+### P2P Sync Implementation
+
+```rust
+// sync/p2p.rs
+use libp2p::{
+    gossipsub, identify, mdns, noise, ping, tcp, yamux,
+    PeerId, Swarm, SwarmBuilder,
+};
+
+pub struct P2PSync {
+    swarm: Swarm<HistdbBehaviour>,
+    document: Document<HistoryReducer>,
+    known_peers: HashSet<PeerId>,
+}
+
+#[derive(NetworkBehaviour)]
+struct HistdbBehaviour {
+    gossipsub: gossipsub::Behaviour,  // Pub/sub for mutations
+    mdns: mdns::tokio::Behaviour,     // LAN peer discovery
+    identify: identify::Behaviour,    // Peer identification
+    ping: ping::Behaviour,            // Keep-alive
+}
+
+impl P2PSync {
+    pub async fn new(config: &P2PConfig, db_path: &Path) -> Result<Self, Error> {
+        let local_key = Self::load_or_generate_keypair(db_path)?;
+        let local_peer_id = PeerId::from(local_key.public());
+
+        // Configure gossipsub for CRDT mutation propagation
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()?;
+
+        let mut swarm = SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
+            .with_quic()  // QUIC for better NAT traversal
+            .with_behaviour(|key| {
+                let gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossipsub_config,
+                )?;
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                Ok(HistdbBehaviour {
+                    gossipsub,
+                    mdns,
+                    identify: identify::Behaviour::new(identify::Config::new(
+                        "/histdb/1.0.0".into(),
+                        key.public(),
+                    )),
+                    ping: ping::Behaviour::default(),
+                })
+            })?
+            .build();
+
+        // Subscribe to histdb mutations topic
+        let topic = gossipsub::IdentTopic::new("histdb-mutations");
+        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+
+        // Listen on configured address
+        swarm.listen_on(config.listen_addr.parse()?)?;
+
+        Ok(Self {
+            swarm,
+            document: Document::open(db_path, HistoryReducer)?,
+            known_peers: HashSet::new(),
+        })
+    }
+
+    pub async fn run(&mut self, mut mutation_rx: mpsc::Receiver<HistoryMutation>) {
+        let topic = gossipsub::IdentTopic::new("histdb-mutations");
+
+        loop {
+            tokio::select! {
+                // Handle local mutations (from writer thread)
+                Some(mutation) = mutation_rx.recv() => {
+                    // Apply locally
+                    self.document.mutate(&mutation);
+
+                    // Broadcast to peers
+                    let data = bincode::serialize(&mutation).unwrap();
+                    if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+                        tracing::warn!("Failed to publish mutation: {}", e);
+                    }
+                }
+
+                // Handle network events
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<HistdbBehaviourEvent>) {
+        match event {
+            // New peer discovered via mDNS
+            SwarmEvent::Behaviour(HistdbBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                for (peer_id, addr) in peers {
+                    tracing::info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
+                    self.swarm.dial(addr)?;
+                    self.known_peers.insert(peer_id);
+                }
+            }
+
+            // Received mutation from peer
+            SwarmEvent::Behaviour(HistdbBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                message,
+                ..
+            })) => {
+                let mutation: HistoryMutation = bincode::deserialize(&message.data)?;
+                // Apply remote mutation (idempotent)
+                self.document.apply_remote(&mutation);
+                tracing::debug!("Applied remote mutation from {}", message.source);
+            }
+
+            // Peer connected
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                tracing::info!("Connected to peer: {}", peer_id);
+                self.known_peers.insert(peer_id);
+                // Request full sync from new peer
+                self.request_sync(&peer_id).await;
+            }
+
+            _ => {}
+        }
+    }
+
+    async fn request_sync(&mut self, peer: &PeerId) {
+        // Request changes since our last known state from this peer
+        // Uses sqlsync's journal-based sync
+    }
+}
 ```
 
 ### Sync Modes
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| **Coordinator** | Central server relays changes | Multi-machine, always-on sync |
-| **P2P** | Direct machine-to-machine | LAN sync, no server |
+| **P2P (default)** | Direct machine-to-machine via libp2p | Primary sync method, no server |
+| **P2P + mDNS** | Auto-discover peers on LAN | Home/office network |
+| **P2P + Signaling** | Use relay for NAT traversal | Cross-network sync |
 | **Manual** | Export/import sync bundles | Air-gapped machines |
 | **Disabled** | Local only | Single machine |
 
@@ -2055,22 +2249,22 @@ criterion = "0.5"             # Benchmarking
 - ✅ **Shell support**: ZSH, BASH, Nushell with shell-agnostic IPC
 - ✅ **Sync**: sqlsync with CRDTs for offline-first, real-time synchronization
 
+### Also Decided
+
+1. ✅ **Backpressure strategy**: Retry with exponential backoff (100μs, 200μs, 400μs)
+2. ✅ **Sync deployment**: P2P via libp2p (no coordinator server required)
+   - gossipsub for mutation propagation
+   - mDNS for LAN peer discovery
+   - QUIC for NAT traversal
+   - Optional signaling server only for NAT hole-punching
+
 ### Still Open
 
-1. **Backpressure strategy**: When write queue is full:
-   - Drop commands (fast, lossy)
-   - Retry with backoff (balanced) ← **Recommended**
-   - Fall back to sync write (reliable, slow)
-
-2. **History ID correlation**: For `FinishCommand`:
+1. **History ID correlation**: For `FinishCommand`:
    - Shell tracks returned ID (more reliable) ← **Recommended**
    - Session + "most recent" heuristic (simpler shell code)
 
-3. **Sync server**: Self-hosted reference implementation?
-   - Simple Rust server with WebSocket
-   - Or rely on third-party (e.g., fly.io deployment)
-
-4. **Import tool priority**: Which formats to support first?
+2. **Import tool priority**: Which formats to support first?
    - zsh-histdb SQLite (migration)
    - .zsh_history / .bash_history (plain text)
    - atuin SQLite
