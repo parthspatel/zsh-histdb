@@ -115,7 +115,9 @@ EOF
 declare -ga _BORING_COMMANDS
 _BORING_COMMANDS=("^ls$" "^cd$" "^ " "^histdb" "^top$" "^htop$")
 
-HISTDB_TABULATE_CMD=(sed -e $'s/\x1f/\t/g')
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    HISTDB_TABULATE_CMD=(sed -e $'s/\x1f/\t/g')
+fi
 
 if [[ -z "${HISTDB_TABULATE_CMD[*]:-}" ]]; then
     declare -ga HISTDB_TABULATE_CMD
