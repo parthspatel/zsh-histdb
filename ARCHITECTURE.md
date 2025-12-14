@@ -14,11 +14,12 @@ A Rust rewrite of zsh-histdb focusing on **safety**, **performance**, and **corr
 - **Input validation**: All user input validated before use
 
 ### Performance
-- **Connection pooling**: Reuse SQLite connections
+- **Lock-free ingestion**: Wait-free MPSC queue for concurrent shell sessions
+- **Zero-copy where possible**: Minimize allocations in hot paths
+- **Batched writes**: Coalesce multiple commands into single transactions
 - **Prepared statements**: Pre-compiled queries for hot paths
-- **Async I/O**: Non-blocking operations where beneficial
 - **Efficient merging**: Optimized 3-way merge algorithm
-- **Minimal shell overhead**: Fast IPC for zsh integration
+- **Minimal shell overhead**: Fire-and-forget IPC, sub-millisecond latency
 
 ### Correctness
 - **Comprehensive tests**: Unit, integration, and property-based testing
@@ -42,6 +43,11 @@ zsh-histdb-rs/
 │   │   │   │   ├── schema.rs     # Type-safe schema definitions
 │   │   │   │   ├── queries.rs    # Prepared query definitions
 │   │   │   │   └── migrations.rs # Schema migrations
+│   │   │   ├── ingest/           # Lock-free ingestion pipeline
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── queue.rs      # Lock-free MPSC queue
+│   │   │   │   ├── writer.rs     # Single-consumer writer thread
+│   │   │   │   └── batch.rs      # Batch accumulation logic
 │   │   │   ├── models/
 │   │   │   │   ├── mod.rs
 │   │   │   │   ├── command.rs    # Command model
@@ -50,7 +56,7 @@ zsh-histdb-rs/
 │   │   │   │   └── session.rs    # Session model
 │   │   │   ├── ops/
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── record.rs     # Record new history
+│   │   │   │   ├── record.rs     # Record new history (via queue)
 │   │   │   │   ├── query.rs      # Query history
 │   │   │   │   ├── forget.rs     # Delete history
 │   │   │   │   ├── merge.rs      # 3-way merge for sync
@@ -93,6 +99,359 @@ zsh-histdb-rs/
     ├── migration_tests.rs
     ├── merge_tests.rs
     └── concurrent_tests.rs
+```
+
+---
+
+## Concurrency Architecture (Lock-Free Design)
+
+The daemon uses a **lock-free, wait-free** architecture to handle concurrent shell sessions with minimal latency.
+
+### Design Goals
+- Shell hooks return in **< 1ms** (fire-and-forget)
+- Support **100+ concurrent shell sessions** without contention
+- **No mutex locks** on the hot path (command recording)
+- Queries see **eventually consistent** data (typically < 10ms delay)
+
+### Architecture Overview
+
+```
+┌─────────┐ ┌─────────┐ ┌─────────┐
+│ Shell 1 │ │ Shell 2 │ │ Shell N │   Multiple producers (shells)
+└────┬────┘ └────┬────┘ └────┬────┘
+     │           │           │
+     ▼           ▼           ▼
+┌────────────────────────────────────┐
+│   Lock-Free MPSC Ring Buffer       │   Wait-free enqueue
+│   (crossbeam-queue ArrayQueue)     │   Bounded capacity (e.g., 4096)
+└─────────────────┬──────────────────┘
+                  │
+                  ▼ (single consumer)
+┌─────────────────────────────────────┐
+│         Writer Thread               │
+│  ┌─────────────────────────────┐   │
+│  │  Batch Accumulator          │   │   Collects entries for batching
+│  │  (VecDeque, drain every     │   │
+│  │   10ms or 64 entries)       │   │
+│  └──────────────┬──────────────┘   │
+│                 ▼                   │
+│  ┌─────────────────────────────┐   │
+│  │  SQLite Transaction         │   │   Single writer, batched inserts
+│  │  (prepared statements)      │   │
+│  └─────────────────────────────┘   │
+└─────────────────────────────────────┘
+```
+
+### Data Structures
+
+#### 1. Lock-Free Command Queue
+
+```rust
+// ingest/queue.rs
+use crossbeam_queue::ArrayQueue;
+
+/// Lock-free bounded queue for incoming commands
+/// - Wait-free push (returns error if full, never blocks)
+/// - Wait-free pop (returns None if empty)
+pub struct CommandQueue {
+    queue: ArrayQueue<PendingCommand>,
+    // Atomic counter for monitoring
+    pending_count: AtomicU64,
+}
+
+#[derive(Clone)]
+pub struct PendingCommand {
+    pub kind: CommandKind,
+    pub timestamp: Instant,  // For latency tracking
+}
+
+pub enum CommandKind {
+    Start {
+        session_id: u64,
+        argv: Box<str>,        // Owned, no lifetime issues
+        dir: Box<Path>,
+        host: Box<str>,
+        start_time: i64,
+        response_tx: Option<oneshot::Sender<HistoryId>>,
+    },
+    Finish {
+        history_id: HistoryId,
+        exit_status: i32,
+        duration_ms: u64,
+    },
+}
+
+impl CommandQueue {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            queue: ArrayQueue::new(capacity),
+            pending_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Wait-free enqueue. Returns Err if queue is full.
+    #[inline]
+    pub fn push(&self, cmd: PendingCommand) -> Result<(), PendingCommand> {
+        self.queue.push(cmd).map(|_| {
+            self.pending_count.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    /// Wait-free dequeue for the writer thread.
+    #[inline]
+    pub fn pop(&self) -> Option<PendingCommand> {
+        self.queue.pop().map(|cmd| {
+            self.pending_count.fetch_sub(1, Ordering::Relaxed);
+            cmd
+        })
+    }
+
+    /// Drain up to `max` entries into a Vec (for batching)
+    pub fn drain_batch(&self, max: usize) -> Vec<PendingCommand> {
+        let mut batch = Vec::with_capacity(max);
+        while batch.len() < max {
+            match self.pop() {
+                Some(cmd) => batch.push(cmd),
+                None => break,
+            }
+        }
+        batch
+    }
+}
+```
+
+#### 2. Writer Thread (Single Consumer)
+
+```rust
+// ingest/writer.rs
+pub struct WriterThread {
+    queue: Arc<CommandQueue>,
+    conn: Connection,
+    // Pre-compiled statements for hot path
+    insert_command_stmt: Statement,
+    insert_place_stmt: Statement,
+    insert_history_stmt: Statement,
+    update_finish_stmt: Statement,
+}
+
+impl WriterThread {
+    pub fn spawn(queue: Arc<CommandQueue>, db_path: &Path) -> JoinHandle<()> {
+        let conn = Connection::open(db_path).expect("Failed to open database");
+        // Optimize for write throughput
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA busy_timeout = 5000;
+        ").unwrap();
+
+        std::thread::spawn(move || {
+            let mut writer = WriterThread::new(queue, conn);
+            writer.run();
+        })
+    }
+
+    fn run(&mut self) {
+        let mut batch = Vec::with_capacity(64);
+        let batch_interval = Duration::from_millis(10);
+        let mut last_flush = Instant::now();
+
+        loop {
+            // Drain available commands (non-blocking)
+            batch.extend(self.queue.drain_batch(64 - batch.len()));
+
+            let should_flush = !batch.is_empty() && (
+                batch.len() >= 64 ||                        // Batch full
+                last_flush.elapsed() >= batch_interval      // Time limit
+            );
+
+            if should_flush {
+                self.flush_batch(&mut batch);
+                last_flush = Instant::now();
+            } else if batch.is_empty() {
+                // No work: park thread briefly to avoid busy-spin
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
+        if batch.is_empty() {
+            return;
+        }
+
+        // Single transaction for entire batch
+        let tx = self.conn.transaction().unwrap();
+
+        for cmd in batch.drain(..) {
+            match cmd.kind {
+                CommandKind::Start { session_id, argv, dir, host, start_time, response_tx } => {
+                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time);
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(id);  // Ignore if receiver dropped
+                    }
+                }
+                CommandKind::Finish { history_id, exit_status, duration_ms } => {
+                    self.update_finish(&tx, history_id, exit_status, duration_ms);
+                }
+            }
+        }
+
+        tx.commit().unwrap();
+    }
+
+    #[inline]
+    fn insert_history_entry(
+        &self,
+        tx: &Transaction,
+        session_id: u64,
+        argv: &str,
+        dir: &Path,
+        host: &str,
+        start_time: i64,
+    ) -> HistoryId {
+        // Uses prepared statements, parameterized queries
+        // ... implementation
+    }
+}
+```
+
+#### 3. Fire-and-Forget IPC Handler
+
+```rust
+// daemon/handler.rs
+pub struct ConnectionHandler {
+    queue: Arc<CommandQueue>,
+    session_id: u64,
+    host: Box<str>,
+}
+
+impl ConnectionHandler {
+    /// Handle incoming StartCommand - returns immediately
+    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+        let cmd = PendingCommand {
+            kind: CommandKind::Start {
+                session_id: self.session_id,
+                argv: argv.into_boxed_str(),
+                dir: PathBuf::from(dir).into_boxed_path(),
+                host: self.host.clone(),
+                start_time: Utc::now().timestamp(),
+                response_tx: None,  // Fire-and-forget: no response channel
+            },
+            timestamp: Instant::now(),
+        };
+
+        match self.queue.push(cmd) {
+            Ok(()) => Response::Accepted,
+            Err(_) => Response::QueueFull,  // Backpressure signal
+        }
+    }
+
+    /// Handle StartCommand with ID response (for finish correlation)
+    pub async fn handle_start_with_id(&self, argv: String, dir: String) -> Response {
+        let (tx, rx) = oneshot::channel();
+
+        let cmd = PendingCommand {
+            kind: CommandKind::Start {
+                session_id: self.session_id,
+                argv: argv.into_boxed_str(),
+                dir: PathBuf::from(dir).into_boxed_path(),
+                host: self.host.clone(),
+                start_time: Utc::now().timestamp(),
+                response_tx: Some(tx),
+            },
+            timestamp: Instant::now(),
+        };
+
+        if self.queue.push(cmd).is_err() {
+            return Response::QueueFull;
+        }
+
+        // Wait for writer to process (typically < 10ms)
+        match tokio::time::timeout(Duration::from_millis(100), rx).await {
+            Ok(Ok(id)) => Response::CommandStarted { id: id.0 },
+            _ => Response::Timeout,
+        }
+    }
+}
+```
+
+### Latency Characteristics
+
+| Operation | Expected Latency | Blocking? |
+|-----------|-----------------|-----------|
+| Shell → Queue (push) | < 100ns | **No** (wait-free) |
+| Queue → SQLite (batch) | 1-10ms | Yes (writer only) |
+| Shell hook total | < 1ms | No |
+| Query (from SQLite) | 1-50ms | Yes (read lock) |
+
+### Backpressure Handling
+
+When the queue is full (extremely rare with 4096 capacity):
+
+```rust
+// Option 1: Drop command (lossy, fast)
+if queue.push(cmd).is_err() {
+    tracing::warn!("Queue full, dropping command");
+}
+
+// Option 2: Inline write (blocking, reliable)
+if queue.push(cmd).is_err() {
+    tracing::warn!("Queue full, falling back to sync write");
+    direct_write_to_db(&cmd);
+}
+
+// Option 3: Retry with backoff (balanced)
+for attempt in 0..3 {
+    if queue.push(cmd.clone()).is_ok() {
+        break;
+    }
+    std::thread::sleep(Duration::from_micros(100 << attempt));
+}
+```
+
+### Query Consistency
+
+Queries read directly from SQLite, which may be slightly behind the queue:
+
+```rust
+// query.rs
+impl QueryExecutor {
+    pub fn query(&self, builder: QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        // Option 1: Read from SQLite only (simple, eventually consistent)
+        self.conn.query(&builder.build_sql())
+
+        // Option 2: Merge with pending queue (complex, strongly consistent)
+        // let db_results = self.conn.query(&builder.build_sql())?;
+        // let pending = self.queue.peek_matching(&builder);
+        // merge_results(db_results, pending)
+    }
+}
+```
+
+**Recommendation**: Use eventual consistency (Option 1). The 10ms delay is imperceptible for interactive use, and strong consistency adds complexity.
+
+### Thread Model Summary
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                     histdb-daemon                        │
+├──────────────────────────────────────────────────────────┤
+│  Thread 1: Async Runtime (tokio)                         │
+│    - Accept Unix socket connections                      │
+│    - Parse JSON requests                                 │
+│    - Push to lock-free queue (wait-free)                 │
+│    - Handle queries (read from SQLite)                   │
+├──────────────────────────────────────────────────────────┤
+│  Thread 2: Writer Thread                                 │
+│    - Drain queue (single consumer)                       │
+│    - Batch writes to SQLite                              │
+│    - Own the write connection                            │
+├──────────────────────────────────────────────────────────┤
+│  Shared: Arc<CommandQueue>                               │
+│    - Lock-free ArrayQueue                                │
+│    - Atomic counters for monitoring                      │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -631,19 +990,35 @@ fn prop_escape_glob_roundtrip() {
 
 ```toml
 [workspace.dependencies]
+# Database
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.24"
+
+# Lock-free concurrency
+crossbeam-queue = "0.3"       # Lock-free ArrayQueue
+crossbeam-channel = "0.5"     # For oneshot-style responses
+parking_lot = "0.12"          # Fast mutexes (for non-hot paths only)
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+
+# CLI & Serialization
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Error handling & utilities
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 regex = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util"] }
+
+# Observability
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Testing
+proptest = "1"                # Property-based testing
+criterion = "0.5"             # Benchmarking
 ```
 
 ---
@@ -659,17 +1034,34 @@ tracing-subscriber = "0.3"
 
 ## Open Questions for Review
 
-1. **Daemon vs embedded**: Should we use a daemon (faster) or spawn per-command (simpler)?
+### Decided
+- ✅ **Daemon vs embedded**: Daemon with lock-free queue (for minimal latency)
+- ✅ **Async runtime**: Tokio for socket handling, dedicated writer thread for SQLite
+- ✅ **Concurrency**: Lock-free MPSC queue with single writer (no contention)
 
-2. **Async runtime**: Use `tokio` for the daemon, or keep it synchronous?
+### Still Open
 
-3. **Config format**: TOML, JSON, or environment-only?
+1. **Config format**: TOML, JSON, or environment-only?
 
-4. **FTS5**: Add full-text search index for better pattern matching?
+2. **FTS5**: Add full-text search index for better pattern matching?
+   - Pro: Much faster substring search on large histories
+   - Con: Increases DB size, complexity
 
-5. **Encryption**: Support SQLCipher for encrypted history?
+3. **Encryption**: Support SQLCipher for encrypted history?
+   - Pro: Security for sensitive commands
+   - Con: Build complexity, performance overhead
 
-6. **Shell support**: Zsh-only, or also bash/fish?
+4. **Shell support**: Zsh-only, or also bash/fish?
+   - Recommendation: Start with zsh, design IPC to be shell-agnostic
+
+5. **Backpressure strategy**: When queue is full, should we:
+   - Drop commands (fast, lossy)
+   - Block briefly with retry (balanced)
+   - Fall back to sync write (reliable, slow)
+
+6. **History ID correlation**: For `FinishCommand`, should we:
+   - Require shell to track returned ID (more reliable)
+   - Use session + "most recent" heuristic (simpler shell code)
 
 ---
 
