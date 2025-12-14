@@ -1,7 +1,6 @@
 {
   lib,
   stdenvNoCC,
-  fetchFromGitHub,
   makeWrapper,
   zsh,
   sqlite,
@@ -9,14 +8,9 @@
 
 stdenvNoCC.mkDerivation {
   pname = "zsh-histdb";
-  version = "0-unstable-2024-04-18";
+  version = "0-unstable-2025-12-13";
 
-  src = fetchFromGitHub {
-    owner = "larkery";
-    repo = "zsh-histdb";
-    rev = "90a6c104d0fcc0410d665e148fa7da28c49684eb";
-    hash = "sha256-vtG1poaRVbfb/wKPChk1WpPgDq+7udLqLfYfLqap4Vg=";
-  };
+  src = lib.cleanSource ./.;
 
   postPatch = ''
     substituteInPlace sqlite-history.zsh \
@@ -41,8 +35,7 @@ stdenvNoCC.mkDerivation {
     homepage = "https://github.com/parthspatel/zsh-histdb-macos";
     license = lib.licenses.mit;
     maintainers = with lib.maintainers; [
-      fliegendewurst
-      luochen1990
+      parthspatel
     ];
     platforms = lib.platforms.unix;
   };
