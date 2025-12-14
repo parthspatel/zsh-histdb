@@ -115,6 +115,8 @@ EOF
 declare -ga _BORING_COMMANDS
 _BORING_COMMANDS=("^ls$" "^cd$" "^ " "^histdb" "^top$" "^htop$")
 
+HISTDB_TABULATE_CMD=(sed -e $'s/\x1f/\t/g')
+
 if [[ -z "${HISTDB_TABULATE_CMD[*]:-}" ]]; then
     declare -ga HISTDB_TABULATE_CMD
     HISTDB_TABULATE_CMD=(column -t -s $'\x1f')
@@ -216,7 +218,7 @@ histdb-sync () {
     # this ought to apply to other readers?
     echo "truncating WAL"
     echo 'pragma wal_checkpoint(truncate);' | _histdb_query_batch
-    
+
     local hist_dir="${HISTDB_FILE:h}"
     if [[ -d "$hist_dir" ]]; then
         () {
