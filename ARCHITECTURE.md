@@ -1,8 +1,9 @@
-# zsh-histdb-rs: Rust Rewrite Architecture
+# histdb-rs: Rust Rewrite Architecture
 
 ## Overview
 
 A Rust rewrite of zsh-histdb focusing on **safety**, **performance**, and **correctness**.
+Multi-shell support for **ZSH**, **BASH**, and **Nushell**.
 
 ## Goals
 
@@ -12,9 +13,11 @@ A Rust rewrite of zsh-histdb focusing on **safety**, **performance**, and **corr
 - **Proper error handling**: All errors propagated via `Result<T, E>`
 - **Transaction safety**: ACID guarantees for all multi-step operations
 - **Input validation**: All user input validated before use
+- **Encryption-ready**: Architecture supports future encryption at rest
 
 ### Performance
 - **Lock-free ingestion**: Wait-free MPSC queue for concurrent shell sessions
+- **Left-Right reads**: Wait-free reads via left-right concurrency pattern
 - **Zero-copy where possible**: Minimize allocations in hot paths
 - **Batched writes**: Coalesce multiple commands into single transactions
 - **Prepared statements**: Pre-compiled queries for hot paths
@@ -26,12 +29,17 @@ A Rust rewrite of zsh-histdb focusing on **safety**, **performance**, and **corr
 - **Migration safety**: Atomic migrations with automatic rollback
 - **Concurrent access**: Proper WAL handling for multi-shell scenarios
 
+### Extensibility
+- **Pluggable search**: SQLite FTS5 default, extensible for alternatives
+- **Multi-shell**: ZSH, BASH, Nushell with shell-agnostic IPC
+- **Future encryption**: Design accommodates SQLCipher or similar
+
 ---
 
 ## Project Structure
 
 ```
-zsh-histdb-rs/
+histdb-rs/
 ├── Cargo.toml                    # Workspace manifest
 ├── crates/
 │   ├── histdb-core/              # Core library
@@ -39,15 +47,25 @@ zsh-histdb-rs/
 │   │   │   ├── lib.rs
 │   │   │   ├── db/
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── connection.rs # Connection management
+│   │   │   │   ├── connection.rs # Connection management (encryption-ready)
 │   │   │   │   ├── schema.rs     # Type-safe schema definitions
 │   │   │   │   ├── queries.rs    # Prepared query definitions
 │   │   │   │   └── migrations.rs # Schema migrations
 │   │   │   ├── ingest/           # Lock-free ingestion pipeline
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── queue.rs      # Lock-free MPSC queue
+│   │   │   │   ├── queue.rs      # Lock-free MPSC queue (writes)
 │   │   │   │   ├── writer.rs     # Single-consumer writer thread
 │   │   │   │   └── batch.rs      # Batch accumulation logic
+│   │   │   ├── read/             # Left-Right read path
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── left_right.rs # Left-right data structure
+│   │   │   │   ├── index.rs      # In-memory recent history index
+│   │   │   │   └── reader.rs     # Wait-free reader handle
+│   │   │   ├── search/           # Extensible search backend
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── traits.rs     # SearchBackend trait
+│   │   │   │   ├── fts5.rs       # SQLite FTS5 implementation
+│   │   │   │   └── simple.rs     # GLOB/LIKE fallback
 │   │   │   ├── models/
 │   │   │   │   ├── mod.rs
 │   │   │   │   ├── command.rs    # Command model
@@ -57,11 +75,15 @@ zsh-histdb-rs/
 │   │   │   ├── ops/
 │   │   │   │   ├── mod.rs
 │   │   │   │   ├── record.rs     # Record new history (via queue)
-│   │   │   │   ├── query.rs      # Query history
+│   │   │   │   ├── query.rs      # Query history (via left-right)
 │   │   │   │   ├── forget.rs     # Delete history
-│   │   │   │   ├── merge.rs      # 3-way merge for sync
 │   │   │   │   └── stats.rs      # Statistics
-│   │   │   ├── config.rs         # Configuration management
+│   │   │   ├── sync/             # CRDT synchronization (sqlsync)
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── mutations.rs  # CRDT mutation types
+│   │   │   │   ├── reducer.rs    # sqlsync reducer
+│   │   │   │   └── worker.rs     # Background sync worker
+│   │   │   ├── config.rs         # TOML configuration
 │   │   │   └── error.rs          # Error types
 │   │   └── Cargo.toml
 │   │
@@ -74,30 +96,44 @@ zsh-histdb-rs/
 │   │   │   │   ├── top.rs        # histdb-top command
 │   │   │   │   ├── sync.rs       # histdb-sync command
 │   │   │   │   ├── forget.rs     # histdb --forget
-│   │   │   │   ├── import.rs     # Import from zsh_history
+│   │   │   │   ├── import.rs     # Import from shell history files
 │   │   │   │   └── export.rs     # Export to JSON/CSV
 │   │   │   ├── output.rs         # Output formatting
 │   │   │   └── args.rs           # Argument parsing (clap)
 │   │   └── Cargo.toml
 │   │
-│   └── histdb-zsh/               # Zsh integration daemon
+│   └── histdb-daemon/            # Shell-agnostic daemon
 │       ├── src/
 │       │   ├── main.rs           # Daemon entry point
 │       │   ├── ipc.rs            # Unix socket IPC
-│       │   ├── protocol.rs       # Wire protocol
-│       │   └── hooks.rs          # Hook message handlers
-│       ├── shell/
-│       │   ├── histdb.zsh        # Minimal zsh wrapper
-│       │   └── histdb-isearch.zsh
+│       │   ├── protocol.rs       # Wire protocol (JSON)
+│       │   └── handlers.rs       # Request handlers
 │       └── Cargo.toml
+│
+├── shell/                        # Shell integrations
+│   ├── zsh/
+│   │   ├── histdb.zsh            # ZSH plugin
+│   │   └── histdb-isearch.zsh    # Interactive search widget
+│   ├── bash/
+│   │   ├── histdb.bash           # BASH plugin
+│   │   └── histdb-search.bash    # Interactive search (fzf-based)
+│   └── nu/
+│       ├── histdb.nu             # Nushell module
+│       └── histdb-search.nu      # Interactive search
 │
 ├── migrations/                   # SQL migration files
 │   ├── 001_initial.sql
-│   └── 002_add_indexes.sql
+│   ├── 002_add_indexes.sql
+│   ├── 003_add_fts5.sql          # Optional FTS5 virtual table
+│   └── 004_add_sync.sql          # UUID, origin_host, sync_state
+│
+├── config/
+│   └── histdb.example.toml       # Example configuration
 │
 └── tests/                        # Integration tests
     ├── migration_tests.rs
     ├── merge_tests.rs
+    ├── left_right_tests.rs
     └── concurrent_tests.rs
 ```
 
@@ -441,17 +477,291 @@ impl QueryExecutor {
 │    - Accept Unix socket connections                      │
 │    - Parse JSON requests                                 │
 │    - Push to lock-free queue (wait-free)                 │
-│    - Handle queries (read from SQLite)                   │
+│    - Handle queries via left-right reader (wait-free)    │
 ├──────────────────────────────────────────────────────────┤
 │  Thread 2: Writer Thread                                 │
 │    - Drain queue (single consumer)                       │
 │    - Batch writes to SQLite                              │
+│    - Update left-right index after commit                │
 │    - Own the write connection                            │
 ├──────────────────────────────────────────────────────────┤
-│  Shared: Arc<CommandQueue>                               │
-│    - Lock-free ArrayQueue                                │
+│  Shared State:                                           │
+│    - Arc<CommandQueue>       (lock-free write queue)     │
+│    - Arc<LeftRight<Index>>   (wait-free read index)      │
 │    - Atomic counters for monitoring                      │
 └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Left-Right Concurrency (Wait-Free Reads)
+
+The **left-right pattern** provides wait-free reads while maintaining consistency with writes.
+This balances the write-heavy ingestion with read-heavy queries.
+
+### How Left-Right Works
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │            Left-Right Structure             │
+                    ├─────────────────────────────────────────────┤
+   Readers ────────▶│  ┌─────────┐         ┌─────────┐           │
+   (many, wait-free)│  │  LEFT   │         │  RIGHT  │           │
+                    │  │  Index  │         │  Index  │           │
+                    │  └─────────┘         └─────────┘           │
+                    │       ▲                   ▲                 │
+                    │       │                   │                 │
+                    │  ┌────┴───────────────────┴────┐           │
+                    │  │     Active Side Pointer     │           │
+                    │  │        (atomic swap)        │           │
+                    │  └─────────────────────────────┘           │
+                    │                   ▲                        │
+   Writer ──────────┼───────────────────┘                        │
+   (one, exclusive) │  1. Write to inactive side                 │
+                    │  2. Swap pointer                           │
+                    │  3. Wait for old readers to finish         │
+                    │  4. Write to other side (now inactive)     │
+                    └─────────────────────────────────────────────┘
+```
+
+### Key Properties
+
+| Property | Guarantee |
+|----------|-----------|
+| Reader latency | **Wait-free** (no locks, no retries) |
+| Writer latency | Bounded (waits for reader epoch) |
+| Consistency | Readers see consistent snapshot |
+| Memory | 2x index size (both sides) |
+
+### Implementation
+
+```rust
+// read/left_right.rs
+use left_right::{ReadHandle, WriteHandle};
+
+/// In-memory index of recent history for fast queries
+pub struct HistoryIndex {
+    /// Recent commands (LRU, bounded size)
+    recent: Vec<RecentEntry>,
+    /// Command → entry IDs (for dedup/lookup)
+    by_command: HashMap<Box<str>, Vec<EntryId>>,
+    /// Directory → entry IDs (for --in/--at queries)
+    by_dir: HashMap<Box<Path>, Vec<EntryId>>,
+    /// Last N entries per session (for isearch)
+    by_session: HashMap<u64, VecDeque<EntryId>>,
+}
+
+#[derive(Clone)]
+pub struct RecentEntry {
+    pub id: EntryId,
+    pub session: u64,
+    pub argv: Box<str>,
+    pub dir: Box<Path>,
+    pub host: Box<str>,
+    pub start_time: i64,
+    pub exit_status: Option<i32>,
+}
+
+/// Operations that can be applied to the index
+pub enum IndexOp {
+    Insert(RecentEntry),
+    UpdateExitStatus { id: EntryId, status: i32, duration: u64 },
+    Evict { before: i64 },  // Evict entries older than timestamp
+}
+
+impl Absorb<IndexOp> for HistoryIndex {
+    fn absorb_first(&mut self, op: &mut IndexOp, _: &Self) {
+        match op {
+            IndexOp::Insert(entry) => {
+                self.by_command
+                    .entry(entry.argv.clone())
+                    .or_default()
+                    .push(entry.id);
+                self.by_dir
+                    .entry(entry.dir.clone())
+                    .or_default()
+                    .push(entry.id);
+                self.by_session
+                    .entry(entry.session)
+                    .or_default()
+                    .push_back(entry.id);
+                self.recent.push(entry.clone());
+            }
+            IndexOp::UpdateExitStatus { id, status, duration } => {
+                if let Some(entry) = self.recent.iter_mut().find(|e| e.id == *id) {
+                    entry.exit_status = Some(*status);
+                }
+            }
+            IndexOp::Evict { before } => {
+                self.recent.retain(|e| e.start_time >= *before);
+                // Also clean up maps...
+            }
+        }
+    }
+
+    fn absorb_second(&mut self, op: IndexOp, other: &Self) {
+        // Same logic, can optimize by copying from `other`
+        self.absorb_first(&mut op, other);
+    }
+}
+
+/// Writer handle (owned by writer thread)
+pub struct IndexWriter {
+    write: WriteHandle<HistoryIndex, IndexOp>,
+}
+
+impl IndexWriter {
+    pub fn insert(&mut self, entry: RecentEntry) {
+        self.write.append(IndexOp::Insert(entry));
+    }
+
+    pub fn update_exit_status(&mut self, id: EntryId, status: i32, duration: u64) {
+        self.write.append(IndexOp::UpdateExitStatus { id, status, duration });
+    }
+
+    /// Publish pending changes to readers
+    pub fn publish(&mut self) {
+        self.write.publish();
+    }
+}
+
+/// Reader handle (cloneable, used by query handlers)
+#[derive(Clone)]
+pub struct IndexReader {
+    read: ReadHandle<HistoryIndex>,
+}
+
+impl IndexReader {
+    /// Wait-free read access
+    pub fn read(&self) -> impl Deref<Target = HistoryIndex> + '_ {
+        self.read.enter().unwrap()
+    }
+
+    /// Query recent history by pattern
+    pub fn search_recent(&self, pattern: &str, limit: usize) -> Vec<RecentEntry> {
+        let guard = self.read();
+        guard.recent
+            .iter()
+            .rev()  // Most recent first
+            .filter(|e| e.argv.contains(pattern))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Query by directory (for --in flag)
+    pub fn search_in_dir(&self, dir: &Path, limit: usize) -> Vec<RecentEntry> {
+        let guard = self.read();
+        guard.by_dir
+            .iter()
+            .filter(|(d, _)| d.starts_with(dir))
+            .flat_map(|(_, ids)| ids.iter())
+            .filter_map(|id| guard.recent.iter().find(|e| e.id == *id))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+```
+
+### Integration with Write Path
+
+```rust
+// ingest/writer.rs - Updated
+impl WriterThread {
+    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
+        let tx = self.conn.transaction().unwrap();
+        let mut index_ops = Vec::with_capacity(batch.len());
+
+        for cmd in batch.drain(..) {
+            match cmd.kind {
+                CommandKind::Start { session_id, argv, dir, host, start_time, response_tx } => {
+                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time);
+
+                    // Queue index update
+                    index_ops.push(IndexOp::Insert(RecentEntry {
+                        id,
+                        session: session_id,
+                        argv: argv.clone(),
+                        dir: dir.clone(),
+                        host: host.clone(),
+                        start_time,
+                        exit_status: None,
+                    }));
+
+                    if let Some(tx) = response_tx {
+                        let _ = tx.send(id);
+                    }
+                }
+                CommandKind::Finish { history_id, exit_status, duration_ms } => {
+                    self.update_finish(&tx, history_id, exit_status, duration_ms);
+                    index_ops.push(IndexOp::UpdateExitStatus {
+                        id: history_id,
+                        status: exit_status,
+                        duration: duration_ms,
+                    });
+                }
+            }
+        }
+
+        tx.commit().unwrap();
+
+        // Apply index updates and publish to readers
+        for op in index_ops {
+            self.index_writer.append(op);
+        }
+        self.index_writer.publish();  // Readers now see new entries
+    }
+}
+```
+
+### Query Path (Wait-Free)
+
+```rust
+// ops/query.rs
+pub struct QueryExecutor {
+    /// Wait-free reader for recent entries
+    index: IndexReader,
+    /// SQLite connection for older entries
+    conn: Connection,
+    /// Search backend (FTS5 or GLOB)
+    search: Box<dyn SearchBackend>,
+}
+
+impl QueryExecutor {
+    pub fn query(&self, builder: &QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        // 1. Fast path: check in-memory index first (wait-free)
+        let recent = self.index.search_recent(
+            builder.pattern.as_deref().unwrap_or(""),
+            builder.limit.unwrap_or(100),
+        );
+
+        if recent.len() >= builder.limit.unwrap_or(100) {
+            // Index had enough results, skip SQLite
+            return Ok(recent.into_iter().map(Into::into).collect());
+        }
+
+        // 2. Slow path: query SQLite for older entries
+        let from_db = self.search.search(&self.conn, builder)?;
+
+        // 3. Merge and deduplicate
+        Ok(merge_results(recent, from_db, builder.limit))
+    }
+}
+```
+
+### Memory Budget
+
+```rust
+// config.rs
+pub struct IndexConfig {
+    /// Maximum entries in memory (default: 10,000)
+    pub max_entries: usize,
+    /// Evict entries older than this (default: 7 days)
+    pub max_age: Duration,
+    /// Memory limit for index (default: 50MB)
+    pub memory_limit: usize,
+}
 ```
 
 ---
@@ -689,50 +999,124 @@ pub enum MergeResult {
 ### 4. Configuration (`histdb-core/src/config.rs`)
 
 ```rust
+#[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Database file path (default: ~/.histdb/zsh-history.db)
-    pub database_path: PathBuf,
+    pub database: DatabaseConfig,
+    pub daemon: DaemonConfig,
+    pub index: IndexConfig,
+    pub search: SearchConfig,
+    pub ignore: IgnoreConfig,
+}
 
-    /// Hostname override
-    pub hostname: String,
+#[derive(Debug, Deserialize)]
+pub struct DatabaseConfig {
+    /// Database file path (default: ~/.histdb/history.db)
+    pub path: PathBuf,
+    /// Hostname override (default: system hostname)
+    pub hostname: Option<String>,
+    /// Enable encryption (future: requires SQLCipher)
+    pub encrypted: bool,
+}
 
-    /// Commands to ignore (regex patterns)
-    pub ignore_patterns: Vec<Regex>,
+#[derive(Debug, Deserialize)]
+pub struct DaemonConfig {
+    /// Unix socket path
+    pub socket_path: PathBuf,
+    /// Write batch size
+    pub batch_size: usize,
+    /// Write batch interval (ms)
+    pub batch_interval_ms: u64,
+    /// Command queue capacity
+    pub queue_capacity: usize,
+}
 
-    /// Whether to respect histignorespace
-    pub ignore_space_prefix: bool,
+#[derive(Debug, Deserialize)]
+pub struct IndexConfig {
+    /// Maximum entries in left-right index
+    pub max_entries: usize,
+    /// Evict entries older than (days)
+    pub max_age_days: u32,
+    /// Memory limit (bytes)
+    pub memory_limit: usize,
+}
 
-    /// Query timeout in milliseconds
-    pub timeout_ms: u64,
+#[derive(Debug, Deserialize)]
+pub struct SearchConfig {
+    /// Search backend: "fts5" | "glob" | "like"
+    pub backend: SearchBackendType,
+    /// FTS5 tokenizer (if using fts5)
+    pub fts5_tokenizer: Option<String>,
+}
 
-    /// Maximum results for interactive search
-    pub max_results: usize,
+#[derive(Debug, Deserialize)]
+pub struct IgnoreConfig {
+    /// Regex patterns for commands to ignore
+    pub patterns: Vec<String>,
+    /// Respect shell's histignorespace
+    pub space_prefix: bool,
 }
 
 impl Config {
-    /// Load from ~/.config/histdb/config.toml
-    pub fn load() -> Result<Self, ConfigError>;
+    /// Load from ~/.config/histdb/config.toml with env overrides
+    pub fn load() -> Result<Self, ConfigError> {
+        let path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.config"))
+            .join("histdb/config.toml");
 
-    /// Load with environment variable overrides
-    pub fn load_with_env() -> Result<Self, ConfigError>;
+        let mut config: Config = if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            toml::from_str(&content)?
+        } else {
+            Config::default()
+        };
+
+        // Environment variable overrides
+        if let Ok(db_path) = std::env::var("HISTDB_DATABASE") {
+            config.database.path = PathBuf::from(db_path);
+        }
+        if let Ok(socket) = std::env::var("HISTDB_SOCKET") {
+            config.daemon.socket_path = PathBuf::from(socket);
+        }
+
+        Ok(config)
+    }
 }
 ```
 
 **Config file format** (`~/.config/histdb/config.toml`):
 ```toml
-database_path = "~/.histdb/zsh-history.db"
-hostname = "my-machine"
-timeout_ms = 1000
-max_results = 100
+# histdb configuration
+
+[database]
+path = "~/.histdb/history.db"
+hostname = "my-machine"          # Optional: override system hostname
+encrypted = false                # Future: SQLCipher encryption
+
+[daemon]
+socket_path = "/run/user/1000/histdb.sock"  # Or use $XDG_RUNTIME_DIR
+batch_size = 64                  # Commands per batch
+batch_interval_ms = 10           # Max wait before flush
+queue_capacity = 4096            # Lock-free queue size
+
+[index]
+max_entries = 10000              # Entries in left-right index
+max_age_days = 7                 # Evict older entries
+memory_limit = 52428800          # 50MB
+
+[search]
+backend = "fts5"                 # "fts5" | "glob" | "like"
+fts5_tokenizer = "unicode61"     # FTS5 tokenizer
 
 [ignore]
+space_prefix = true              # Ignore commands starting with space
 patterns = [
     "^ls$",
     "^cd$",
-    "^ ",           # commands starting with space
     "^histdb",
     "^top$",
     "^htop$",
+    "^exit$",
+    "^clear$",
 ]
 ```
 
@@ -810,49 +1194,191 @@ pub struct QueryArgs {
 
 ---
 
-### 6. Zsh Integration (`histdb-zsh/`)
+### 6. Extensible Search Backend (`histdb-core/src/search/`)
 
-**Architecture**: Long-running daemon with Unix socket IPC
+The search system uses a trait-based design for extensibility:
+
+```rust
+// search/traits.rs
+pub trait SearchBackend: Send + Sync {
+    /// Search commands matching pattern
+    fn search(
+        &self,
+        conn: &Connection,
+        query: &QueryBuilder,
+    ) -> Result<Vec<HistoryRow>, Error>;
+
+    /// Initialize backend (create indexes, virtual tables, etc.)
+    fn initialize(&self, conn: &Connection) -> Result<(), Error>;
+
+    /// Check if backend is available
+    fn is_available(&self, conn: &Connection) -> bool;
+}
+
+// search/fts5.rs - SQLite FTS5 implementation
+pub struct Fts5Backend {
+    tokenizer: String,
+}
+
+impl Fts5Backend {
+    pub fn new(tokenizer: &str) -> Self {
+        Self { tokenizer: tokenizer.to_string() }
+    }
+}
+
+impl SearchBackend for Fts5Backend {
+    fn initialize(&self, conn: &Connection) -> Result<(), Error> {
+        conn.execute_batch(&format!(r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS commands_fts
+            USING fts5(argv, tokenize='{}');
+
+            -- Trigger to keep FTS in sync
+            CREATE TRIGGER IF NOT EXISTS commands_fts_insert
+            AFTER INSERT ON commands BEGIN
+                INSERT INTO commands_fts(rowid, argv) VALUES (NEW.id, NEW.argv);
+            END;
+        "#, self.tokenizer))?;
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        conn: &Connection,
+        query: &QueryBuilder,
+    ) -> Result<Vec<HistoryRow>, Error> {
+        let pattern = query.pattern.as_deref().unwrap_or("");
+        // FTS5 query with proper escaping
+        let fts_query = format!("\"{}\"", pattern.replace('"', "\"\""));
+
+        conn.prepare(&format!(r#"
+            SELECT h.*, c.argv, p.host, p.dir
+            FROM commands_fts fts
+            JOIN commands c ON c.id = fts.rowid
+            JOIN history h ON h.command_id = c.id
+            JOIN places p ON h.place_id = p.id
+            WHERE commands_fts MATCH ?1
+            {}
+            ORDER BY h.start_time DESC
+            LIMIT ?2
+        "#, query.build_where_clause()))?
+        .query_map(params![fts_query, query.limit], |row| /* ... */)
+    }
+
+    fn is_available(&self, conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM pragma_compile_options WHERE compile_options = 'ENABLE_FTS5'",
+            [],
+            |_| Ok(()),
+        ).is_ok()
+    }
+}
+
+// search/simple.rs - GLOB fallback
+pub struct GlobBackend;
+
+impl SearchBackend for GlobBackend {
+    fn initialize(&self, _conn: &Connection) -> Result<(), Error> {
+        Ok(()) // No setup needed
+    }
+
+    fn search(
+        &self,
+        conn: &Connection,
+        query: &QueryBuilder,
+    ) -> Result<Vec<HistoryRow>, Error> {
+        let pattern = format!("*{}*", escape_glob(query.pattern.as_deref().unwrap_or("")));
+        // Standard GLOB query...
+    }
+
+    fn is_available(&self, _conn: &Connection) -> bool {
+        true // Always available
+    }
+}
+
+/// Factory function to create search backend from config
+pub fn create_backend(config: &SearchConfig, conn: &Connection) -> Box<dyn SearchBackend> {
+    match config.backend {
+        SearchBackendType::Fts5 => {
+            let backend = Fts5Backend::new(
+                config.fts5_tokenizer.as_deref().unwrap_or("unicode61")
+            );
+            if backend.is_available(conn) {
+                return Box::new(backend);
+            }
+            tracing::warn!("FTS5 not available, falling back to GLOB");
+        }
+        SearchBackendType::Like => return Box::new(LikeBackend),
+        SearchBackendType::Glob => {}
+    }
+    Box::new(GlobBackend)
+}
+```
+
+---
+
+### 7. Multi-Shell Integration (`shell/`)
+
+**Architecture**: Shell-agnostic daemon with thin shell wrappers
 
 ```
-┌─────────────┐     Unix Socket      ┌─────────────────┐
-│   zsh       │◄────────────────────►│  histdb-daemon  │
-│  (hooks)    │   JSON messages      │  (Rust binary)  │
-└─────────────┘                      └────────┬────────┘
-                                              │
-                                              ▼
-                                     ┌─────────────────┐
-                                     │    SQLite DB    │
-                                     └─────────────────┘
+┌─────────────┐
+│     ZSH     │──┐
+└─────────────┘  │
+┌─────────────┐  │   Unix Socket      ┌─────────────────┐
+│    BASH     │──┼──────────────────►│  histdb-daemon  │
+└─────────────┘  │   JSON protocol    │  (Rust binary)  │
+┌─────────────┐  │                    └────────┬────────┘
+│   Nushell   │──┘                             │
+└─────────────┘                                ▼
+                                      ┌─────────────────┐
+                                      │    SQLite DB    │
+                                      └─────────────────┘
 ```
 
-#### Protocol (`protocol.rs`)
+#### Protocol (`daemon/protocol.rs`)
 ```rust
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Request {
+    /// Register a new shell session
+    Register {
+        shell: ShellType,
+        pid: u32,
+    },
+    /// Record command start
     StartCommand {
         argv: String,
         dir: String,
-        #[serde(default)]
-        session: Option<i64>,
+        session_id: Option<u64>,
     },
+    /// Record command completion
     FinishCommand {
         id: i64,
         exit_status: i32,
     },
+    /// Query history
     Query {
         pattern: Option<String>,
         limit: usize,
         offset: usize,
-        host_filter: bool,
-        dir_filter: bool,
+        filters: QueryFilters,
     },
+    /// Graceful shutdown
     Shutdown,
 }
 
 #[derive(Serialize, Deserialize)]
+pub enum ShellType {
+    Zsh,
+    Bash,
+    Nu,
+    Other(String),
+}
+
+#[derive(Serialize, Deserialize)]
 pub enum Response {
+    Registered { session_id: u64 },
+    Accepted,
     CommandStarted { id: i64 },
     CommandFinished,
     QueryResults { entries: Vec<HistoryEntry> },
@@ -860,31 +1386,510 @@ pub enum Response {
 }
 ```
 
-#### Minimal Zsh Wrapper (`shell/histdb.zsh`)
+#### ZSH Integration (`shell/zsh/histdb.zsh`)
 ```zsh
-# Thin wrapper - all logic in Rust daemon
-typeset -g HISTDB_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/histdb-${UID}.sock"
+# histdb ZSH integration - thin wrapper over daemon
+autoload -U add-zsh-hook
+
+typeset -g HISTDB_SOCKET="${HISTDB_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/histdb-${UID}.sock}"
+typeset -g HISTDB_SESSION=""
 typeset -g HISTDB_LAST_ID=""
 
-_histdb_send() {
-    echo "$1" | socat - UNIX-CONNECT:${HISTDB_SOCKET} 2>/dev/null
+# Use zsh/net/socket if available, fall back to socat
+if zmodload zsh/net/socket 2>/dev/null; then
+    _histdb_send() {
+        local fd
+        zsocket $HISTDB_SOCKET && fd=$REPLY
+        [[ -n $fd ]] || return 1
+        print -u $fd -- "$1"
+        local response
+        read -u $fd response
+        exec {fd}>&-
+        print -- "$response"
+    }
+else
+    _histdb_send() {
+        print -- "$1" | socat -t1 - UNIX-CONNECT:$HISTDB_SOCKET 2>/dev/null
+    }
+fi
+
+_histdb_init() {
+    [[ -n $HISTDB_SESSION ]] && return
+    local resp=$(_histdb_send '{"type":"Register","shell":"Zsh","pid":'$$'}')
+    HISTDB_SESSION=$(print -- "$resp" | jq -r '.session_id // empty')
 }
 
 _histdb_addhistory() {
-    local response=$(_histdb_send "{\"type\":\"StartCommand\",\"argv\":\"${1[0,-2]}\",\"dir\":\"${PWD}\"}")
-    HISTDB_LAST_ID=$(echo "$response" | jq -r '.id // empty')
+    _histdb_init
+    local cmd="${1[1,-2]}"  # Remove trailing newline
+    [[ -z "$cmd" ]] && return 0
+    local json='{"type":"StartCommand","argv":"'${cmd//\"/\\\"}'",'
+    json+='"dir":"'${PWD//\"/\\\"}'","session_id":'$HISTDB_SESSION'}'
+    local resp=$(_histdb_send "$json")
+    HISTDB_LAST_ID=$(print -- "$resp" | jq -r '.id // empty')
+    return 0
 }
 
 _histdb_precmd() {
     local status=$?
-    [[ -n "$HISTDB_LAST_ID" ]] && \
-        _histdb_send "{\"type\":\"FinishCommand\",\"id\":${HISTDB_LAST_ID},\"exit_status\":${status}}" &|
+    [[ -z "$HISTDB_LAST_ID" ]] && return
+    _histdb_send '{"type":"FinishCommand","id":'$HISTDB_LAST_ID',"exit_status":'$status'}' &!
     HISTDB_LAST_ID=""
 }
 
 add-zsh-hook zshaddhistory _histdb_addhistory
 add-zsh-hook precmd _histdb_precmd
 ```
+
+#### BASH Integration (`shell/bash/histdb.bash`)
+```bash
+# histdb BASH integration
+HISTDB_SOCKET="${HISTDB_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/histdb-$(id -u).sock}"
+HISTDB_SESSION=""
+HISTDB_LAST_ID=""
+HISTDB_LAST_CMD=""
+
+_histdb_send() {
+    echo "$1" | socat -t1 - UNIX-CONNECT:"$HISTDB_SOCKET" 2>/dev/null
+}
+
+_histdb_init() {
+    [[ -n "$HISTDB_SESSION" ]] && return
+    local resp
+    resp=$(_histdb_send '{"type":"Register","shell":"Bash","pid":'"$$"'}')
+    HISTDB_SESSION=$(echo "$resp" | jq -r '.session_id // empty')
+}
+
+_histdb_preexec() {
+    _histdb_init
+    local cmd="$1"
+    [[ -z "$cmd" ]] && return
+    # Escape for JSON
+    cmd="${cmd//\\/\\\\}"
+    cmd="${cmd//\"/\\\"}"
+    cmd="${cmd//$'\n'/\\n}"
+    local json='{"type":"StartCommand","argv":"'"$cmd"'",'
+    json+='"dir":"'"${PWD//\"/\\\"}"'","session_id":'"$HISTDB_SESSION"'}'
+    local resp
+    resp=$(_histdb_send "$json")
+    HISTDB_LAST_ID=$(echo "$resp" | jq -r '.id // empty')
+}
+
+_histdb_precmd() {
+    local status=$?
+    [[ -z "$HISTDB_LAST_ID" ]] && return
+    _histdb_send '{"type":"FinishCommand","id":'"$HISTDB_LAST_ID"',"exit_status":'"$status"'}' &
+    HISTDB_LAST_ID=""
+}
+
+# BASH doesn't have preexec, use DEBUG trap
+_histdb_debug() {
+    [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
+    [[ "$BASH_COMMAND" == "_histdb_precmd" ]] && return
+    [[ "$HISTDB_LAST_CMD" == "$BASH_COMMAND" ]] && return
+    HISTDB_LAST_CMD="$BASH_COMMAND"
+    _histdb_preexec "$BASH_COMMAND"
+}
+
+trap '_histdb_debug' DEBUG
+PROMPT_COMMAND="_histdb_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+```
+
+#### Nushell Integration (`shell/nu/histdb.nu`)
+```nu
+# histdb Nushell integration
+
+let-env HISTDB_SOCKET = ($env.HISTDB_SOCKET? | default $"($env.XDG_RUNTIME_DIR? | default '/tmp')/histdb-($env.USER).sock")
+mut histdb_session = null
+mut histdb_last_id = null
+
+def histdb-send [msg: string] {
+    echo $msg | socat -t1 - $"UNIX-CONNECT:($env.HISTDB_SOCKET)" | from json
+}
+
+def histdb-init [] {
+    if $histdb_session == null {
+        let resp = (histdb-send $'{"type":"Register","shell":"Nu","pid":($nu.pid)}')
+        $histdb_session = $resp.session_id
+    }
+}
+
+# Hook into command execution
+$env.config.hooks.pre_execution = {||
+    histdb-init
+    let cmd = (commandline)
+    if ($cmd | is-empty) { return }
+    let json = {
+        type: "StartCommand"
+        argv: $cmd
+        dir: $env.PWD
+        session_id: $histdb_session
+    } | to json
+    let resp = (histdb-send $json)
+    $histdb_last_id = $resp.id?
+}
+
+$env.config.hooks.env_change = {
+    PWD: {|before, after|
+        # Could track directory changes if needed
+    }
+}
+
+# Note: Nushell doesn't expose exit status in hooks yet
+# This is a limitation we document
+```
+
+#### Shell Feature Matrix
+
+| Feature | ZSH | BASH | Nushell |
+|---------|-----|------|---------|
+| Command recording | ✅ | ✅ | ✅ |
+| Exit status | ✅ | ✅ | ⚠️ Limited |
+| Command duration | ✅ | ✅ | ✅ |
+| Native socket | ✅ (zsh/net/socket) | ❌ (socat) | ❌ (socat) |
+| Interactive search | ✅ (widget) | ✅ (fzf) | ✅ (menu) |
+| Async send | ✅ (&!) | ✅ (&) | ⚠️ |
+
+---
+
+## Synchronization Architecture (sqlsync + CRDTs)
+
+Real-time, offline-first synchronization using **sqlsync** for CRDT-based SQLite replication.
+
+### Why sqlsync?
+
+| Feature | Git-based (current) | Event Log | sqlsync (CRDTs) |
+|---------|---------------------|-----------|-----------------|
+| Offline-first | ✅ | ✅ | ✅ |
+| Real-time sync | ❌ | ✅ | ✅ |
+| Conflict resolution | Manual merge | Last-write-wins | **Automatic (CRDT)** |
+| Consistency | Eventual | Eventual | **Strong eventual** |
+| Complexity | Low | Medium | Medium |
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Machine A                                    │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐ │
+│  │   Shells    │───▶│   Daemon    │───▶│  Local SQLite + sqlsync │ │
+│  └─────────────┘    │             │    │  (CRDT operations)      │ │
+│                     │  ┌────────┐ │    └───────────┬─────────────┘ │
+│                     │  │ Sync   │ │                │               │
+│                     │  │ Worker │◀┼────────────────┘               │
+│                     │  └───┬────┘ │                                │
+│                     └─────│──────┘                                 │
+│                           │                                         │
+└───────────────────────────┼─────────────────────────────────────────┘
+                            │
+                            │ WebSocket / HTTP
+                            │ (CRDT sync messages)
+                            ▼
+                   ┌─────────────────┐
+                   │   Sync Server   │  (Optional: can be P2P)
+                   │   (Coordinator) │
+                   └────────┬────────┘
+                            │
+┌───────────────────────────┼─────────────────────────────────────────┐
+│                           │                                         │
+│  ┌─────────────┐    ┌─────▼───────┐    ┌─────────────────────────┐ │
+│  │   Shells    │───▶│   Daemon    │───▶│  Local SQLite + sqlsync │ │
+│  └─────────────┘    └─────────────┘    └─────────────────────────┘ │
+│                         Machine B                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### sqlsync Integration
+
+```rust
+// sync/mod.rs
+use sqlsync::{Document, JournalId, Mutation, Reducer};
+
+/// History entry with CRDT-friendly ID
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SyncableEntry {
+    /// Globally unique, time-ordered ID (UUIDv7)
+    pub id: Uuid,
+    /// Host that created this entry
+    pub origin_host: String,
+    /// Original local ID (for reference)
+    pub local_id: i64,
+    /// Entry data
+    pub session: u64,
+    pub argv: String,
+    pub dir: String,
+    pub host: String,
+    pub start_time: i64,
+    pub exit_status: Option<i32>,
+    pub duration: Option<u64>,
+}
+
+/// Mutations that can be applied to history
+#[derive(Clone, Serialize, Deserialize)]
+pub enum HistoryMutation {
+    /// Insert a new history entry
+    InsertEntry(SyncableEntry),
+    /// Update exit status (idempotent)
+    UpdateExitStatus {
+        entry_id: Uuid,
+        exit_status: i32,
+        duration: u64,
+    },
+    /// Delete an entry (soft delete via tombstone)
+    DeleteEntry { entry_id: Uuid },
+}
+
+/// Reducer that applies mutations to SQLite
+pub struct HistoryReducer;
+
+impl Reducer for HistoryReducer {
+    type Mutation = HistoryMutation;
+    type Error = rusqlite::Error;
+
+    fn apply(&self, conn: &Connection, mutation: &Self::Mutation) -> Result<(), Self::Error> {
+        match mutation {
+            HistoryMutation::InsertEntry(entry) => {
+                // Insert command (idempotent via UNIQUE constraint)
+                conn.execute(
+                    "INSERT OR IGNORE INTO commands (argv) VALUES (?1)",
+                    params![&entry.argv],
+                )?;
+
+                // Insert place (idempotent)
+                conn.execute(
+                    "INSERT OR IGNORE INTO places (host, dir) VALUES (?1, ?2)",
+                    params![&entry.host, &entry.dir],
+                )?;
+
+                // Insert history with global UUID
+                conn.execute(
+                    r#"INSERT OR IGNORE INTO history
+                       (uuid, session, command_id, place_id, start_time, exit_status, duration, origin_host)
+                       SELECT ?1, ?2, c.id, p.id, ?3, ?4, ?5, ?6
+                       FROM commands c, places p
+                       WHERE c.argv = ?7 AND p.host = ?8 AND p.dir = ?9"#,
+                    params![
+                        entry.id.to_string(),
+                        entry.session,
+                        entry.start_time,
+                        entry.exit_status,
+                        entry.duration,
+                        entry.origin_host,
+                        entry.argv,
+                        entry.host,
+                        entry.dir,
+                    ],
+                )?;
+            }
+            HistoryMutation::UpdateExitStatus { entry_id, exit_status, duration } => {
+                // Idempotent update
+                conn.execute(
+                    "UPDATE history SET exit_status = ?1, duration = ?2 WHERE uuid = ?3",
+                    params![exit_status, duration, entry_id.to_string()],
+                )?;
+            }
+            HistoryMutation::DeleteEntry { entry_id } => {
+                // Soft delete via deleted_at timestamp
+                conn.execute(
+                    "UPDATE history SET deleted_at = unixepoch() WHERE uuid = ?1",
+                    params![entry_id.to_string()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+### Schema Updates for Sync
+
+```sql
+-- migrations/004_add_sync.sql
+
+-- Add UUID column for global identification
+ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
+ALTER TABLE history ADD COLUMN origin_host TEXT;
+ALTER TABLE history ADD COLUMN deleted_at INTEGER;
+
+-- Index for sync queries
+CREATE INDEX IF NOT EXISTS history_uuid ON history(uuid);
+CREATE INDEX IF NOT EXISTS history_deleted ON history(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- Sync metadata table
+CREATE TABLE IF NOT EXISTS sync_state (
+    peer_id TEXT PRIMARY KEY,
+    last_sync_time INTEGER,
+    last_journal_id TEXT
+);
+```
+
+### Sync Worker
+
+```rust
+// sync/worker.rs
+pub struct SyncWorker {
+    document: Document<HistoryReducer>,
+    coordinator_url: Option<String>,
+    local_conn: Connection,
+    sync_interval: Duration,
+}
+
+impl SyncWorker {
+    pub fn new(
+        db_path: &Path,
+        coordinator_url: Option<String>,
+    ) -> Result<Self, Error> {
+        let local_conn = Connection::open(db_path)?;
+        let document = Document::open(db_path, HistoryReducer)?;
+
+        Ok(Self {
+            document,
+            coordinator_url,
+            local_conn,
+            sync_interval: Duration::from_secs(5),
+        })
+    }
+
+    pub async fn run(&mut self) {
+        loop {
+            // 1. Apply local mutations from writer thread
+            if let Some(mutations) = self.pending_mutations.drain() {
+                for mutation in mutations {
+                    self.document.mutate(mutation);
+                }
+            }
+
+            // 2. Sync with coordinator (if online)
+            if let Some(url) = &self.coordinator_url {
+                match self.sync_with_coordinator(url).await {
+                    Ok(changes) => {
+                        tracing::debug!("Synced {} changes", changes);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Sync failed (will retry): {}", e);
+                    }
+                }
+            }
+
+            tokio::time::sleep(self.sync_interval).await;
+        }
+    }
+
+    async fn sync_with_coordinator(&mut self, url: &str) -> Result<usize, Error> {
+        // 1. Get local changes since last sync
+        let local_changes = self.document.changes_since(self.last_sync_journal)?;
+
+        // 2. Send to coordinator
+        let client = reqwest::Client::new();
+        let response: SyncResponse = client
+            .post(&format!("{}/sync", url))
+            .json(&SyncRequest {
+                peer_id: self.peer_id.clone(),
+                changes: local_changes,
+                last_seen: self.last_sync_journal,
+            })
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        // 3. Apply remote changes
+        let mut applied = 0;
+        for change in response.remote_changes {
+            self.document.apply_remote(change)?;
+            applied += 1;
+        }
+
+        // 4. Update sync state
+        self.last_sync_journal = response.new_journal_id;
+
+        Ok(applied)
+    }
+}
+```
+
+### Integration with Daemon
+
+```rust
+// daemon/main.rs
+pub struct Daemon {
+    // Existing
+    command_queue: Arc<CommandQueue>,
+    index_reader: IndexReader,
+
+    // New: sync channel
+    sync_tx: mpsc::Sender<HistoryMutation>,
+}
+
+impl Daemon {
+    pub fn spawn_sync_worker(&self, config: &SyncConfig) -> JoinHandle<()> {
+        let sync_rx = self.sync_rx.clone();
+        let db_path = config.database.path.clone();
+        let coordinator = config.sync.coordinator_url.clone();
+
+        tokio::spawn(async move {
+            let mut worker = SyncWorker::new(&db_path, coordinator)
+                .expect("Failed to create sync worker");
+
+            // Feed mutations from main writer
+            worker.set_mutation_source(sync_rx);
+            worker.run().await;
+        })
+    }
+}
+
+// In writer thread: also send to sync
+impl WriterThread {
+    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
+        // ... existing SQLite writes ...
+
+        // Send mutations to sync worker
+        for entry in &written_entries {
+            let mutation = HistoryMutation::InsertEntry(entry.to_syncable());
+            let _ = self.sync_tx.send(mutation);
+        }
+    }
+}
+```
+
+### Configuration
+
+```toml
+# ~/.config/histdb/config.toml
+
+[sync]
+enabled = true
+# Coordinator URL (optional - can run P2P only)
+coordinator_url = "https://histdb-sync.example.com"
+# Sync interval in seconds
+interval_secs = 5
+# Peer ID (auto-generated if not set)
+peer_id = "machine-a-uuid"
+
+[sync.p2p]
+enabled = false  # Future: direct P2P sync
+listen_port = 4242
+```
+
+### Sync Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Coordinator** | Central server relays changes | Multi-machine, always-on sync |
+| **P2P** | Direct machine-to-machine | LAN sync, no server |
+| **Manual** | Export/import sync bundles | Air-gapped machines |
+| **Disabled** | Local only | Single machine |
+
+### Conflict Resolution (CRDT Semantics)
+
+Since history is append-mostly, conflicts are rare. When they occur:
+
+| Conflict Type | Resolution |
+|---------------|------------|
+| Same entry inserted twice | Deduplicate by UUID (idempotent) |
+| Exit status updated from multiple places | Last-write-wins by timestamp |
+| Entry deleted on one machine, updated on another | Delete wins (tombstone) |
+| Clock skew | UUIDv7 provides rough ordering; sync timestamp used for LWW |
 
 ---
 
@@ -996,7 +2001,12 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 # Lock-free concurrency
 crossbeam-queue = "0.3"       # Lock-free ArrayQueue
 crossbeam-channel = "0.5"     # For oneshot-style responses
+left-right = "0.11"           # Wait-free reads via left-right pattern
 parking_lot = "0.12"          # Fast mutexes (for non-hot paths only)
+
+# Sync (CRDT-based)
+sqlsync = "0.2"               # CRDT sync for SQLite
+sqlsync-reducer = "0.2"       # Reducer framework for sqlsync
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
@@ -1011,6 +2021,7 @@ thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 regex = "1"
+uuid = { version = "1", features = ["v7"] }  # Time-ordered UUIDs for entries
 
 # Observability
 tracing = "0.1"
@@ -1037,38 +2048,54 @@ criterion = "0.5"             # Benchmarking
 ### Decided
 - ✅ **Daemon vs embedded**: Daemon with lock-free queue (for minimal latency)
 - ✅ **Async runtime**: Tokio for socket handling, dedicated writer thread for SQLite
-- ✅ **Concurrency**: Lock-free MPSC queue with single writer (no contention)
+- ✅ **Concurrency**: Lock-free MPSC queue for writes, left-right for reads
+- ✅ **Config format**: TOML with environment variable overrides
+- ✅ **FTS**: SQLite FTS5 default, extensible via `SearchBackend` trait
+- ✅ **Encryption**: Design supports future SQLCipher (deferred implementation)
+- ✅ **Shell support**: ZSH, BASH, Nushell with shell-agnostic IPC
+- ✅ **Sync**: sqlsync with CRDTs for offline-first, real-time synchronization
 
 ### Still Open
 
-1. **Config format**: TOML, JSON, or environment-only?
-
-2. **FTS5**: Add full-text search index for better pattern matching?
-   - Pro: Much faster substring search on large histories
-   - Con: Increases DB size, complexity
-
-3. **Encryption**: Support SQLCipher for encrypted history?
-   - Pro: Security for sensitive commands
-   - Con: Build complexity, performance overhead
-
-4. **Shell support**: Zsh-only, or also bash/fish?
-   - Recommendation: Start with zsh, design IPC to be shell-agnostic
-
-5. **Backpressure strategy**: When queue is full, should we:
+1. **Backpressure strategy**: When write queue is full:
    - Drop commands (fast, lossy)
-   - Block briefly with retry (balanced)
+   - Retry with backoff (balanced) ← **Recommended**
    - Fall back to sync write (reliable, slow)
 
-6. **History ID correlation**: For `FinishCommand`, should we:
-   - Require shell to track returned ID (more reliable)
-   - Use session + "most recent" heuristic (simpler shell code)
+2. **History ID correlation**: For `FinishCommand`:
+   - Shell tracks returned ID (more reliable) ← **Recommended**
+   - Session + "most recent" heuristic (simpler shell code)
+
+3. **Sync server**: Self-hosted reference implementation?
+   - Simple Rust server with WebSocket
+   - Or rely on third-party (e.g., fly.io deployment)
+
+4. **Import tool priority**: Which formats to support first?
+   - zsh-histdb SQLite (migration)
+   - .zsh_history / .bash_history (plain text)
+   - atuin SQLite
 
 ---
 
 ## Summary
 
 This architecture prioritizes:
+
 - **Safety**: Parameterized queries, type-safe models, proper error handling
-- **Performance**: Connection pooling, prepared statements, daemon architecture
+- **Performance**: Lock-free writes, wait-free reads (left-right), batched SQLite operations
 - **Correctness**: Transaction safety, comprehensive testing, atomic migrations
+- **Extensibility**: Pluggable search backends, multi-shell support, encryption-ready
+- **Sync**: Offline-first CRDT synchronization via sqlsync
 - **Maintainability**: Clean separation of concerns, well-defined interfaces
+
+### Key Design Decisions
+
+| Aspect | Decision | Rationale |
+|--------|----------|-----------|
+| Write path | Lock-free MPSC queue | Sub-millisecond shell latency |
+| Read path | Left-right pattern | Wait-free queries |
+| Storage | SQLite + WAL | Reliable, portable, well-understood |
+| Search | FTS5 (extensible) | Fast full-text, graceful fallback |
+| Sync | sqlsync CRDTs | Offline-first, automatic conflict resolution |
+| Config | TOML | Human-readable, well-supported |
+| Shells | ZSH, BASH, Nushell | Cover majority of users |
