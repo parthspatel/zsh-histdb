@@ -1591,310 +1591,524 @@ $env.config.hooks.env_change = {
 
 ---
 
-## Synchronization Architecture (sqlsync + CRDTs)
+## Synchronization Architecture (Raft Consensus)
 
-Real-time, offline-first synchronization using **sqlsync** for CRDT-based SQLite replication.
+Real-time, strongly consistent synchronization using **Raft** consensus. Every machine is a full peer that can become the cluster leader—no dedicated coordination server required.
 
-### Why sqlsync?
+### Why Raft?
 
-| Feature | Git-based (current) | Event Log | sqlsync (CRDTs) |
-|---------|---------------------|-----------|-----------------|
-| Offline-first | ✅ | ✅ | ✅ |
+| Feature | Git-based (current) | CRDTs | **Raft** |
+|---------|---------------------|-------|----------|
+| Consistency | Eventual | Strong eventual | **Strong (linearizable)** |
+| Offline writes | ✅ | ✅ | ⚠️ Local queue, commit on reconnect |
 | Real-time sync | ❌ | ✅ | ✅ |
-| Conflict resolution | Manual merge | Last-write-wins | **Automatic (CRDT)** |
-| Consistency | Eventual | Eventual | **Strong eventual** |
-| Complexity | Low | Medium | Medium |
+| Conflict resolution | Manual merge | Automatic (semantic) | **No conflicts (consensus)** |
+| Coordination server | ❌ | ❌ | **❌ (every node is peer)** |
+| Ordering guarantee | None | Partial | **Total order** |
 
-### Architecture Overview (P2P Primary)
+### Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Machine A                                    │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐ │
-│  │   Shells    │───▶│   Daemon    │───▶│  Local SQLite + sqlsync │ │
-│  └─────────────┘    │             │    │  (CRDT operations)      │ │
-│                     │  ┌────────┐ │    └───────────┬─────────────┘ │
-│                     │  │ Sync   │ │                │               │
-│                     │  │ Worker │◀┼────────────────┘               │
-│                     │  └───┬────┘ │                                │
-│                     └─────│──────┘                                 │
-│                           │                                         │
-└───────────────────────────┼─────────────────────────────────────────┘
-                            │
-                            │ P2P (libp2p / QUIC)
-                            │ Direct machine-to-machine
-                            │
-┌───────────────────────────┼─────────────────────────────────────────┐
-│                           │                                         │
-│  ┌─────────────┐    ┌─────▼───────┐    ┌─────────────────────────┐ │
-│  │   Shells    │───▶│   Daemon    │───▶│  Local SQLite + sqlsync │ │
-│  └─────────────┘    │             │    │  (CRDT operations)      │ │
-│                     │  ┌────────┐ │    └───────────┬─────────────┘ │
-│                     │  │ Sync   │ │                │               │
-│                     │  │ Worker │◀┼────────────────┘               │
-│                     │  └────────┘ │                                │
-│                     └─────────────┘                                 │
-│                         Machine B                                    │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              Raft Cluster                                │
+│         Every machine is a peer; leader elected dynamically              │
+│                                                                          │
+│   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    │
+│   │   Machine A     │    │   Machine B     │    │   Machine C     │    │
+│   │   (Leader)      │◄──►│   (Follower)    │◄──►│   (Follower)    │    │
+│   │                 │    │                 │    │                 │    │
+│   │ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │    │
+│   │ │ Raft Node   │ │    │ │ Raft Node   │ │    │ │ Raft Node   │ │    │
+│   │ │ (openraft)  │ │    │ │ (openraft)  │ │    │ │ (openraft)  │ │    │
+│   │ └──────┬──────┘ │    │ └──────┬──────┘ │    │ └──────┬──────┘ │    │
+│   │        │        │    │        │        │    │        │        │    │
+│   │ ┌──────▼──────┐ │    │ ┌──────▼──────┐ │    │ ┌──────▼──────┐ │    │
+│   │ │   SQLite    │ │    │ │   SQLite    │ │    │ │   SQLite    │ │    │
+│   │ │ (state mach)│ │    │ │ (state mach)│ │    │ │ (state mach)│ │    │
+│   │ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │    │
+│   └─────────────────┘    └─────────────────┘    └─────────────────┘    │
+│            ▲                      ▲                      ▲              │
+│            │                      │                      │              │
+│     ┌──────┴──────┐        ┌──────┴──────┐        ┌──────┴──────┐      │
+│     │   Shells    │        │   Shells    │        │   Shells    │      │
+│     └─────────────┘        └─────────────┘        └─────────────┘      │
+└─────────────────────────────────────────────────────────────────────────┘
 
-Optional: Bootstrap/Relay Server (for NAT traversal)
-┌─────────────────┐
-│  Signaling Hub  │  Only for peer discovery & NAT hole-punching
-│  (lightweight)  │  No data storage, no single point of failure
-└─────────────────┘
+Writes: Shell → Local Daemon → Raft Leader → Replicate → Commit → Apply to all SQLite
+Reads:  Shell → Local Daemon → Local SQLite (consistent after commit)
 ```
 
-### sqlsync Integration
+### Key Properties
+
+| Property | Guarantee |
+|----------|-----------|
+| **Consistency** | Linearizable (all nodes see same order) |
+| **Availability** | Requires quorum (N/2 + 1 nodes online) |
+| **Partition tolerance** | Leader in majority partition continues |
+| **Leader election** | Automatic, typically < 1 second |
+| **Log replication** | Guaranteed delivery to majority |
+
+### Raft Node Implementation
 
 ```rust
-// sync/mod.rs
-use sqlsync::{Document, JournalId, Mutation, Reducer};
+// sync/raft.rs
+use openraft::{Config, Raft, RaftNetworkFactory, RaftStorage};
+use openraft::error::RaftError;
 
-/// History entry with CRDT-friendly ID
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SyncableEntry {
-    /// Globally unique, time-ordered ID (UUIDv7)
-    pub id: Uuid,
-    /// Host that created this entry
-    pub origin_host: String,
-    /// Original local ID (for reference)
-    pub local_id: i64,
-    /// Entry data
-    pub session: u64,
-    pub argv: String,
-    pub dir: String,
-    pub host: String,
-    pub start_time: i64,
-    pub exit_status: Option<i32>,
-    pub duration: Option<u64>,
-}
+/// Node ID is derived from machine's unique identifier
+pub type NodeId = u64;
 
-/// Mutations that can be applied to history
-#[derive(Clone, Serialize, Deserialize)]
-pub enum HistoryMutation {
+/// History mutation that gets replicated via Raft log
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LogEntry {
     /// Insert a new history entry
-    InsertEntry(SyncableEntry),
-    /// Update exit status (idempotent)
-    UpdateExitStatus {
-        entry_id: Uuid,
-        exit_status: i32,
-        duration: u64,
+    InsertEntry {
+        uuid: Uuid,           // UUIDv7 for global uniqueness
+        origin_node: NodeId,
+        session: u64,
+        argv: String,
+        dir: String,
+        host: String,
+        start_time: i64,
     },
-    /// Delete an entry (soft delete via tombstone)
-    DeleteEntry { entry_id: Uuid },
+    /// Update exit status
+    UpdateExitStatus {
+        uuid: Uuid,
+        exit_status: i32,
+        duration_ms: u64,
+    },
+    /// Delete entry (tombstone)
+    DeleteEntry {
+        uuid: Uuid,
+    },
+    /// Cluster membership change
+    AddNode { node_id: NodeId, addr: String },
+    RemoveNode { node_id: NodeId },
 }
 
-/// Reducer that applies mutations to SQLite
-pub struct HistoryReducer;
+/// Response from applying a log entry
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LogResponse {
+    Success,
+    EntryId(Uuid),
+}
 
-impl Reducer for HistoryReducer {
-    type Mutation = HistoryMutation;
-    type Error = rusqlite::Error;
+/// SQLite-backed state machine for Raft
+pub struct HistdbStateMachine {
+    conn: Connection,
+    last_applied_log: Option<LogId>,
+    last_membership: StoredMembership,
+}
 
-    fn apply(&self, conn: &Connection, mutation: &Self::Mutation) -> Result<(), Self::Error> {
-        match mutation {
-            HistoryMutation::InsertEntry(entry) => {
-                // Insert command (idempotent via UNIQUE constraint)
-                conn.execute(
-                    "INSERT OR IGNORE INTO commands (argv) VALUES (?1)",
-                    params![&entry.argv],
-                )?;
+impl RaftStateMachine<TypeConfig> for HistdbStateMachine {
+    async fn apply(&mut self, entries: Vec<Entry<TypeConfig>>) -> Vec<LogResponse> {
+        let tx = self.conn.transaction().unwrap();
+        let mut responses = Vec::with_capacity(entries.len());
 
-                // Insert place (idempotent)
-                conn.execute(
-                    "INSERT OR IGNORE INTO places (host, dir) VALUES (?1, ?2)",
-                    params![&entry.host, &entry.dir],
-                )?;
+        for entry in entries {
+            let resp = match entry.payload {
+                EntryPayload::Normal(LogEntry::InsertEntry {
+                    uuid, origin_node, session, argv, dir, host, start_time
+                }) => {
+                    // Insert command (idempotent)
+                    tx.execute(
+                        "INSERT OR IGNORE INTO commands (argv) VALUES (?1)",
+                        params![&argv],
+                    ).unwrap();
 
-                // Insert history with global UUID
-                conn.execute(
-                    r#"INSERT OR IGNORE INTO history
-                       (uuid, session, command_id, place_id, start_time, exit_status, duration, origin_host)
-                       SELECT ?1, ?2, c.id, p.id, ?3, ?4, ?5, ?6
-                       FROM commands c, places p
-                       WHERE c.argv = ?7 AND p.host = ?8 AND p.dir = ?9"#,
-                    params![
-                        entry.id.to_string(),
-                        entry.session,
-                        entry.start_time,
-                        entry.exit_status,
-                        entry.duration,
-                        entry.origin_host,
-                        entry.argv,
-                        entry.host,
-                        entry.dir,
-                    ],
-                )?;
-            }
-            HistoryMutation::UpdateExitStatus { entry_id, exit_status, duration } => {
-                // Idempotent update
-                conn.execute(
-                    "UPDATE history SET exit_status = ?1, duration = ?2 WHERE uuid = ?3",
-                    params![exit_status, duration, entry_id.to_string()],
-                )?;
-            }
-            HistoryMutation::DeleteEntry { entry_id } => {
-                // Soft delete via deleted_at timestamp
-                conn.execute(
-                    "UPDATE history SET deleted_at = unixepoch() WHERE uuid = ?1",
-                    params![entry_id.to_string()],
-                )?;
-            }
+                    // Insert place (idempotent)
+                    tx.execute(
+                        "INSERT OR IGNORE INTO places (host, dir) VALUES (?1, ?2)",
+                        params![&host, &dir],
+                    ).unwrap();
+
+                    // Insert history with UUID
+                    tx.execute(
+                        r#"INSERT OR IGNORE INTO history
+                           (uuid, session, command_id, place_id, start_time, origin_node)
+                           SELECT ?1, ?2, c.id, p.id, ?3, ?4
+                           FROM commands c, places p
+                           WHERE c.argv = ?5 AND p.host = ?6 AND p.dir = ?7"#,
+                        params![
+                            uuid.to_string(), session, start_time, origin_node,
+                            &argv, &host, &dir
+                        ],
+                    ).unwrap();
+
+                    LogResponse::EntryId(uuid)
+                }
+
+                EntryPayload::Normal(LogEntry::UpdateExitStatus {
+                    uuid, exit_status, duration_ms
+                }) => {
+                    tx.execute(
+                        "UPDATE history SET exit_status = ?1, duration = ?2 WHERE uuid = ?3",
+                        params![exit_status, duration_ms, uuid.to_string()],
+                    ).unwrap();
+                    LogResponse::Success
+                }
+
+                EntryPayload::Normal(LogEntry::DeleteEntry { uuid }) => {
+                    tx.execute(
+                        "UPDATE history SET deleted_at = unixepoch() WHERE uuid = ?1",
+                        params![uuid.to_string()],
+                    ).unwrap();
+                    LogResponse::Success
+                }
+
+                EntryPayload::Membership(m) => {
+                    self.last_membership = StoredMembership::new(Some(entry.log_id), m);
+                    LogResponse::Success
+                }
+
+                _ => LogResponse::Success,
+            };
+
+            responses.push(resp);
+            self.last_applied_log = Some(entry.log_id);
         }
+
+        tx.commit().unwrap();
+        responses
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        HistdbSnapshotBuilder {
+            db_path: self.db_path.clone(),
+        }
+    }
+}
+
+/// Raft log storage backed by SQLite
+pub struct HistdbLogStore {
+    conn: Connection,
+}
+
+impl RaftLogStorage<TypeConfig> for HistdbLogStore {
+    async fn append(&mut self, entries: Vec<Entry<TypeConfig>>) -> Result<(), StorageError> {
+        let tx = self.conn.transaction()?;
+        for entry in entries {
+            let data = bincode::serialize(&entry)?;
+            tx.execute(
+                "INSERT INTO raft_log (log_index, term, data) VALUES (?1, ?2, ?3)",
+                params![entry.log_id.index, entry.log_id.leader_id.term, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    async fn truncate(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        self.conn.execute(
+            "DELETE FROM raft_log WHERE log_index >= ?1",
+            params![log_id.index],
+        )?;
+        Ok(())
+    }
+
+    // ... other required methods
+}
+```
+
+### Network Layer
+
+```rust
+// sync/network.rs
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+/// Raft RPC messages
+#[derive(Clone, Serialize, Deserialize)]
+pub enum RaftMessage {
+    AppendEntries(AppendEntriesRequest),
+    AppendEntriesResponse(AppendEntriesResponse),
+    Vote(VoteRequest),
+    VoteResponse(VoteResponse),
+    InstallSnapshot(InstallSnapshotRequest),
+    InstallSnapshotResponse(InstallSnapshotResponse),
+    // Client requests
+    ClientWrite(LogEntry),
+    ClientWriteResponse(ClientWriteResponse),
+}
+
+/// Network factory for Raft
+pub struct HistdbNetwork {
+    /// Known peers: NodeId -> (address, connection)
+    peers: Arc<RwLock<HashMap<NodeId, PeerConnection>>>,
+    /// Our listen address
+    listen_addr: SocketAddr,
+}
+
+impl RaftNetworkFactory<TypeConfig> for HistdbNetwork {
+    type Network = HistdbNetworkConnection;
+
+    async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
+        let addr = node.addr.parse().unwrap();
+        HistdbNetworkConnection::new(target, addr)
+    }
+}
+
+pub struct HistdbNetworkConnection {
+    target: NodeId,
+    addr: SocketAddr,
+    conn: Option<Framed<TcpStream, LengthDelimitedCodec>>,
+}
+
+impl RaftNetwork<TypeConfig> for HistdbNetworkConnection {
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<TypeConfig>,
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError> {
+        self.send_rpc(RaftMessage::AppendEntries(req)).await
+    }
+
+    async fn vote(
+        &mut self,
+        req: VoteRequest<TypeConfig>,
+    ) -> Result<VoteResponse<TypeConfig>, RPCError> {
+        self.send_rpc(RaftMessage::Vote(req)).await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest<TypeConfig>,
+    ) -> Result<InstallSnapshotResponse<TypeConfig>, RPCError> {
+        self.send_rpc(RaftMessage::InstallSnapshot(req)).await
+    }
+}
+
+impl HistdbNetworkConnection {
+    async fn send_rpc<R: DeserializeOwned>(&mut self, msg: RaftMessage) -> Result<R, RPCError> {
+        // Lazy connection establishment
+        if self.conn.is_none() {
+            let stream = TcpStream::connect(self.addr).await?;
+            self.conn = Some(Framed::new(stream, LengthDelimitedCodec::new()));
+        }
+
+        let conn = self.conn.as_mut().unwrap();
+        let data = bincode::serialize(&msg)?;
+        conn.send(data.into()).await?;
+
+        let response = conn.next().await.ok_or(RPCError::Disconnected)??;
+        Ok(bincode::deserialize(&response)?)
+    }
+}
+```
+
+### Daemon Integration
+
+```rust
+// daemon/main.rs
+pub struct Daemon {
+    // Local write queue (for shell latency)
+    command_queue: Arc<CommandQueue>,
+    index_reader: IndexReader,
+
+    // Raft node
+    raft: Raft<TypeConfig>,
+    node_id: NodeId,
+}
+
+impl Daemon {
+    pub async fn new(config: &Config) -> Result<Self, Error> {
+        let node_id = config.sync.node_id;
+
+        // Initialize Raft components
+        let log_store = HistdbLogStore::new(&config.database.path)?;
+        let state_machine = HistdbStateMachine::new(&config.database.path)?;
+        let network = HistdbNetwork::new(&config.sync.listen_addr);
+
+        let raft_config = Config {
+            cluster_name: "histdb".to_string(),
+            heartbeat_interval: 100,           // 100ms heartbeat
+            election_timeout_min: 300,         // 300-500ms election timeout
+            election_timeout_max: 500,
+            ..Default::default()
+        };
+
+        let raft = Raft::new(
+            node_id,
+            Arc::new(raft_config),
+            network,
+            log_store,
+            state_machine,
+        ).await?;
+
+        Ok(Self {
+            command_queue: Arc::new(CommandQueue::new(4096)),
+            index_reader: IndexReader::new(),
+            raft,
+            node_id,
+        })
+    }
+
+    /// Handle shell command - queue locally then replicate via Raft
+    pub async fn handle_command(&self, cmd: PendingCommand) -> Result<Uuid, Error> {
+        let uuid = Uuid::now_v7();
+
+        // 1. Queue for local write (immediate response to shell)
+        self.command_queue.push_with_retry(cmd.clone(), 3)?;
+
+        // 2. Submit to Raft for replication (async)
+        let entry = LogEntry::InsertEntry {
+            uuid,
+            origin_node: self.node_id,
+            session: cmd.session_id,
+            argv: cmd.argv.to_string(),
+            dir: cmd.dir.to_string_lossy().to_string(),
+            host: cmd.host.to_string(),
+            start_time: cmd.start_time,
+        };
+
+        // Fire-and-forget to Raft - will be committed asynchronously
+        let raft = self.raft.clone();
+        tokio::spawn(async move {
+            match raft.client_write(entry).await {
+                Ok(_) => tracing::debug!("Command {} replicated", uuid),
+                Err(e) => tracing::warn!("Replication failed (will retry): {}", e),
+            }
+        });
+
+        Ok(uuid)
+    }
+
+    /// Join an existing cluster
+    pub async fn join_cluster(&self, peer_addr: &str) -> Result<(), Error> {
+        // Connect to existing node and request to join
+        let mut conn = HistdbNetworkConnection::new_direct(peer_addr).await?;
+
+        let response = conn.send_rpc(RaftMessage::ClientWrite(
+            LogEntry::AddNode {
+                node_id: self.node_id,
+                addr: self.config.sync.listen_addr.clone(),
+            }
+        )).await?;
+
+        tracing::info!("Joined cluster via {}", peer_addr);
+        Ok(())
+    }
+
+    /// Bootstrap a new single-node cluster
+    pub async fn bootstrap_cluster(&self) -> Result<(), Error> {
+        let members = BTreeMap::from([(
+            self.node_id,
+            Node {
+                addr: self.config.sync.listen_addr.clone(),
+            },
+        )]);
+
+        self.raft.initialize(members).await?;
+        tracing::info!("Bootstrapped new cluster as leader");
         Ok(())
     }
 }
 ```
 
-### Schema Updates for Sync
-
-```sql
--- migrations/004_add_sync.sql
-
--- Add UUID column for global identification
-ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
-ALTER TABLE history ADD COLUMN origin_host TEXT;
-ALTER TABLE history ADD COLUMN deleted_at INTEGER;
-
--- Index for sync queries
-CREATE INDEX IF NOT EXISTS history_uuid ON history(uuid);
-CREATE INDEX IF NOT EXISTS history_deleted ON history(deleted_at) WHERE deleted_at IS NOT NULL;
-
--- Sync metadata table
-CREATE TABLE IF NOT EXISTS sync_state (
-    peer_id TEXT PRIMARY KEY,
-    last_sync_time INTEGER,
-    last_journal_id TEXT
-);
-```
-
-### Sync Worker
+### Offline Operation & Reconnection
 
 ```rust
-// sync/worker.rs
-pub struct SyncWorker {
-    document: Document<HistoryReducer>,
-    coordinator_url: Option<String>,
-    local_conn: Connection,
-    sync_interval: Duration,
+// sync/offline.rs
+
+/// Queue for commands made while disconnected from cluster
+pub struct OfflineQueue {
+    entries: VecDeque<LogEntry>,
+    max_size: usize,
+    persistence_path: PathBuf,
 }
 
-impl SyncWorker {
-    pub fn new(
-        db_path: &Path,
-        coordinator_url: Option<String>,
-    ) -> Result<Self, Error> {
-        let local_conn = Connection::open(db_path)?;
-        let document = Document::open(db_path, HistoryReducer)?;
-
-        Ok(Self {
-            document,
-            coordinator_url,
-            local_conn,
-            sync_interval: Duration::from_secs(5),
-        })
+impl OfflineQueue {
+    /// Queue a command when we can't reach quorum
+    pub fn enqueue(&mut self, entry: LogEntry) -> Result<(), Error> {
+        if self.entries.len() >= self.max_size {
+            return Err(Error::OfflineQueueFull);
+        }
+        self.entries.push_back(entry);
+        self.persist()?;
+        Ok(())
     }
 
-    pub async fn run(&mut self) {
-        loop {
-            // 1. Apply local mutations from writer thread
-            if let Some(mutations) = self.pending_mutations.drain() {
-                for mutation in mutations {
-                    self.document.mutate(mutation);
+    /// Replay queued entries when cluster connectivity is restored
+    pub async fn replay(&mut self, raft: &Raft<TypeConfig>) -> Result<usize, Error> {
+        let mut replayed = 0;
+
+        while let Some(entry) = self.entries.pop_front() {
+            match raft.client_write(entry.clone()).await {
+                Ok(_) => {
+                    replayed += 1;
+                }
+                Err(RaftError::ForwardToLeader { .. }) => {
+                    // Not leader, but cluster is available - retry will forward
+                    replayed += 1;
+                }
+                Err(e) => {
+                    // Still can't reach cluster - put it back
+                    self.entries.push_front(entry);
+                    break;
                 }
             }
-
-            // 2. Sync with coordinator (if online)
-            if let Some(url) = &self.coordinator_url {
-                match self.sync_with_coordinator(url).await {
-                    Ok(changes) => {
-                        tracing::debug!("Synced {} changes", changes);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Sync failed (will retry): {}", e);
-                    }
-                }
-            }
-
-            tokio::time::sleep(self.sync_interval).await;
-        }
-    }
-
-    async fn sync_with_coordinator(&mut self, url: &str) -> Result<usize, Error> {
-        // 1. Get local changes since last sync
-        let local_changes = self.document.changes_since(self.last_sync_journal)?;
-
-        // 2. Send to coordinator
-        let client = reqwest::Client::new();
-        let response: SyncResponse = client
-            .post(&format!("{}/sync", url))
-            .json(&SyncRequest {
-                peer_id: self.peer_id.clone(),
-                changes: local_changes,
-                last_seen: self.last_sync_journal,
-            })
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        // 3. Apply remote changes
-        let mut applied = 0;
-        for change in response.remote_changes {
-            self.document.apply_remote(change)?;
-            applied += 1;
         }
 
-        // 4. Update sync state
-        self.last_sync_journal = response.new_journal_id;
-
-        Ok(applied)
+        self.persist()?;
+        Ok(replayed)
     }
-}
-```
-
-### Integration with Daemon
-
-```rust
-// daemon/main.rs
-pub struct Daemon {
-    // Existing
-    command_queue: Arc<CommandQueue>,
-    index_reader: IndexReader,
-
-    // New: sync channel
-    sync_tx: mpsc::Sender<HistoryMutation>,
 }
 
 impl Daemon {
-    pub fn spawn_sync_worker(&self, config: &SyncConfig) -> JoinHandle<()> {
-        let sync_rx = self.sync_rx.clone();
-        let db_path = config.database.path.clone();
-        let coordinator = config.sync.coordinator_url.clone();
+    pub async fn handle_command_with_offline(&self, cmd: PendingCommand) -> Result<Uuid, Error> {
+        let uuid = Uuid::now_v7();
+        let entry = cmd.to_log_entry(uuid, self.node_id);
 
-        tokio::spawn(async move {
-            let mut worker = SyncWorker::new(&db_path, coordinator)
-                .expect("Failed to create sync worker");
-
-            // Feed mutations from main writer
-            worker.set_mutation_source(sync_rx);
-            worker.run().await;
-        })
-    }
-}
-
-// In writer thread: also send to sync
-impl WriterThread {
-    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
-        // ... existing SQLite writes ...
-
-        // Send mutations to sync worker
-        for entry in &written_entries {
-            let mutation = HistoryMutation::InsertEntry(entry.to_syncable());
-            let _ = self.sync_tx.send(mutation);
+        // Try Raft replication
+        match self.raft.client_write(entry.clone()).await {
+            Ok(_) => {
+                // Successfully committed
+                Ok(uuid)
+            }
+            Err(RaftError::QuorumNotReached { .. }) => {
+                // Can't reach quorum - queue for later
+                tracing::warn!("Cluster unavailable, queueing command {}", uuid);
+                self.offline_queue.lock().await.enqueue(entry)?;
+                Ok(uuid)
+            }
+            Err(e) => Err(e.into()),
         }
     }
 }
+```
+
+### Schema Updates for Raft
+
+```sql
+-- migrations/004_add_raft_sync.sql
+
+-- Add UUID column for global identification
+ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
+ALTER TABLE history ADD COLUMN origin_node INTEGER;
+ALTER TABLE history ADD COLUMN deleted_at INTEGER;
+
+-- Raft log storage
+CREATE TABLE IF NOT EXISTS raft_log (
+    log_index INTEGER PRIMARY KEY,
+    term INTEGER NOT NULL,
+    data BLOB NOT NULL
+);
+
+-- Raft vote state (must survive restarts)
+CREATE TABLE IF NOT EXISTS raft_state (
+    key TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
+
+-- Cluster membership
+CREATE TABLE IF NOT EXISTS raft_members (
+    node_id INTEGER PRIMARY KEY,
+    addr TEXT NOT NULL,
+    is_learner INTEGER DEFAULT 0
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS history_uuid ON history(uuid);
+CREATE INDEX IF NOT EXISTS history_origin ON history(origin_node);
 ```
 
 ### Configuration
@@ -1904,186 +2118,117 @@ impl WriterThread {
 
 [sync]
 enabled = true
-# Sync interval in seconds
-interval_secs = 5
-# Peer ID (auto-generated if not set, persisted in DB)
-peer_id = "machine-a-uuid"
+# Unique node ID (auto-generated from machine-id if not set)
+# node_id = 1
 
-[sync.p2p]
-enabled = true
-# Listen address for incoming peer connections
-listen_addr = "/ip4/0.0.0.0/tcp/4242"
-# Known peers (can also be discovered via mDNS)
-bootstrap_peers = [
-    "/ip4/192.168.1.100/tcp/4242/p2p/QmPeer1...",
-    "/ip4/192.168.1.101/tcp/4242/p2p/QmPeer2...",
-]
-# Enable mDNS for automatic LAN discovery
+# Listen address for Raft RPC
+listen_addr = "0.0.0.0:4242"
+
+# Bootstrap: set to true on first node only
+bootstrap = false
+
+# Peer to join (for new nodes joining existing cluster)
+join_peer = "192.168.1.100:4242"
+
+[sync.raft]
+# Heartbeat interval (ms)
+heartbeat_interval = 100
+# Election timeout range (ms)
+election_timeout_min = 300
+election_timeout_max = 500
+# Snapshot threshold (entries before compaction)
+snapshot_threshold = 10000
+
+[sync.offline]
+# Max entries to queue when disconnected
+max_queue_size = 10000
+# Persist offline queue to disk
+persistence_path = "~/.histdb/offline_queue"
+
+[sync.discovery]
+# Enable mDNS for automatic peer discovery on LAN
 mdns_enabled = true
-# Optional: signaling server for NAT traversal
-signaling_url = "https://histdb-signal.example.com"  # Optional
-
-[sync.p2p.limits]
-max_peers = 10
-max_pending_mutations = 10000
+# Service name for mDNS
+mdns_service = "_histdb._tcp.local"
 ```
 
-### P2P Sync Implementation
+### Cluster Operations
 
 ```rust
-// sync/p2p.rs
-use libp2p::{
-    gossipsub, identify, mdns, noise, ping, tcp, yamux,
-    PeerId, Swarm, SwarmBuilder,
-};
+// CLI commands for cluster management
 
-pub struct P2PSync {
-    swarm: Swarm<HistdbBehaviour>,
-    document: Document<HistoryReducer>,
-    known_peers: HashSet<PeerId>,
+/// histdb cluster status
+pub async fn cluster_status(daemon: &Daemon) -> ClusterStatus {
+    let metrics = daemon.raft.metrics().borrow().clone();
+
+    ClusterStatus {
+        node_id: daemon.node_id,
+        state: metrics.state,                    // Leader/Follower/Candidate
+        leader: metrics.current_leader,
+        term: metrics.current_term,
+        last_log_index: metrics.last_log_index,
+        commit_index: metrics.commit_index,
+        members: metrics.membership_config.membership().nodes().collect(),
+    }
 }
 
-#[derive(NetworkBehaviour)]
-struct HistdbBehaviour {
-    gossipsub: gossipsub::Behaviour,  // Pub/sub for mutations
-    mdns: mdns::tokio::Behaviour,     // LAN peer discovery
-    identify: identify::Behaviour,    // Peer identification
-    ping: ping::Behaviour,            // Keep-alive
+/// histdb cluster add-node <addr>
+pub async fn add_node(daemon: &Daemon, addr: &str) -> Result<NodeId, Error> {
+    // Generate node ID from address hash or let them provide it
+    let node_id = hash_addr(addr);
+
+    daemon.raft.change_membership(
+        ChangeMembers::AddNodes(btreemap! { node_id => Node { addr: addr.to_string() }}),
+        true,  // Turn learners to voters automatically
+    ).await?;
+
+    Ok(node_id)
 }
 
-impl P2PSync {
-    pub async fn new(config: &P2PConfig, db_path: &Path) -> Result<Self, Error> {
-        let local_key = Self::load_or_generate_keypair(db_path)?;
-        let local_peer_id = PeerId::from(local_key.public());
+/// histdb cluster remove-node <node-id>
+pub async fn remove_node(daemon: &Daemon, node_id: NodeId) -> Result<(), Error> {
+    daemon.raft.change_membership(
+        ChangeMembers::RemoveNodes(btreeset! { node_id }),
+        true,
+    ).await?;
 
-        // Configure gossipsub for CRDT mutation propagation
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(10))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .build()?;
-
-        let mut swarm = SwarmBuilder::with_existing_identity(local_key)
-            .with_tokio()
-            .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-            .with_quic()  // QUIC for better NAT traversal
-            .with_behaviour(|key| {
-                let gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossipsub_config,
-                )?;
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-                Ok(HistdbBehaviour {
-                    gossipsub,
-                    mdns,
-                    identify: identify::Behaviour::new(identify::Config::new(
-                        "/histdb/1.0.0".into(),
-                        key.public(),
-                    )),
-                    ping: ping::Behaviour::default(),
-                })
-            })?
-            .build();
-
-        // Subscribe to histdb mutations topic
-        let topic = gossipsub::IdentTopic::new("histdb-mutations");
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-
-        // Listen on configured address
-        swarm.listen_on(config.listen_addr.parse()?)?;
-
-        Ok(Self {
-            swarm,
-            document: Document::open(db_path, HistoryReducer)?,
-            known_peers: HashSet::new(),
-        })
-    }
-
-    pub async fn run(&mut self, mut mutation_rx: mpsc::Receiver<HistoryMutation>) {
-        let topic = gossipsub::IdentTopic::new("histdb-mutations");
-
-        loop {
-            tokio::select! {
-                // Handle local mutations (from writer thread)
-                Some(mutation) = mutation_rx.recv() => {
-                    // Apply locally
-                    self.document.mutate(&mutation);
-
-                    // Broadcast to peers
-                    let data = bincode::serialize(&mutation).unwrap();
-                    if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                        tracing::warn!("Failed to publish mutation: {}", e);
-                    }
-                }
-
-                // Handle network events
-                event = self.swarm.select_next_some() => {
-                    self.handle_swarm_event(event).await;
-                }
-            }
-        }
-    }
-
-    async fn handle_swarm_event(&mut self, event: SwarmEvent<HistdbBehaviourEvent>) {
-        match event {
-            // New peer discovered via mDNS
-            SwarmEvent::Behaviour(HistdbBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-                for (peer_id, addr) in peers {
-                    tracing::info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
-                    self.swarm.dial(addr)?;
-                    self.known_peers.insert(peer_id);
-                }
-            }
-
-            // Received mutation from peer
-            SwarmEvent::Behaviour(HistdbBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                message,
-                ..
-            })) => {
-                let mutation: HistoryMutation = bincode::deserialize(&message.data)?;
-                // Apply remote mutation (idempotent)
-                self.document.apply_remote(&mutation);
-                tracing::debug!("Applied remote mutation from {}", message.source);
-            }
-
-            // Peer connected
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                tracing::info!("Connected to peer: {}", peer_id);
-                self.known_peers.insert(peer_id);
-                // Request full sync from new peer
-                self.request_sync(&peer_id).await;
-            }
-
-            _ => {}
-        }
-    }
-
-    async fn request_sync(&mut self, peer: &PeerId) {
-        // Request changes since our last known state from this peer
-        // Uses sqlsync's journal-based sync
-    }
+    Ok(())
 }
 ```
 
-### Sync Modes
+### Consistency Modes
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| **P2P (default)** | Direct machine-to-machine via libp2p | Primary sync method, no server |
-| **P2P + mDNS** | Auto-discover peers on LAN | Home/office network |
-| **P2P + Signaling** | Use relay for NAT traversal | Cross-network sync |
-| **Manual** | Export/import sync bundles | Air-gapped machines |
-| **Disabled** | Local only | Single machine |
+| **Strong (default)** | Wait for Raft commit before responding | Most operations |
+| **Leader read** | Read from leader only (linearizable) | When consistency is critical |
+| **Local read** | Read from local replica | Performance-critical queries |
+| **Stale read** | Read with bounded staleness | Historical queries |
 
-### Conflict Resolution (CRDT Semantics)
-
-Since history is append-mostly, conflicts are rare. When they occur:
-
-| Conflict Type | Resolution |
-|---------------|------------|
-| Same entry inserted twice | Deduplicate by UUID (idempotent) |
-| Exit status updated from multiple places | Last-write-wins by timestamp |
-| Entry deleted on one machine, updated on another | Delete wins (tombstone) |
-| Clock skew | UUIDv7 provides rough ordering; sync timestamp used for LWW |
+```rust
+impl Daemon {
+    pub async fn query(&self, builder: &QueryBuilder, mode: ReadMode) -> Result<Vec<HistoryRow>> {
+        match mode {
+            ReadMode::Strong => {
+                // Ensure we have latest committed entries
+                self.raft.ensure_linearizable().await?;
+                self.query_local(builder)
+            }
+            ReadMode::LeaderRead => {
+                // Forward to leader if we're not it
+                if !self.raft.is_leader() {
+                    return self.forward_to_leader(builder).await;
+                }
+                self.query_local(builder)
+            }
+            ReadMode::Local | ReadMode::Stale => {
+                // Read directly from local SQLite
+                self.query_local(builder)
+            }
+        }
+    }
+}
+```
 
 ---
 
@@ -2198,9 +2343,9 @@ crossbeam-channel = "0.5"     # For oneshot-style responses
 left-right = "0.11"           # Wait-free reads via left-right pattern
 parking_lot = "0.12"          # Fast mutexes (for non-hot paths only)
 
-# Sync (CRDT-based)
-sqlsync = "0.2"               # CRDT sync for SQLite
-sqlsync-reducer = "0.2"       # Reducer framework for sqlsync
+# Raft consensus
+openraft = "0.9"              # Async Raft consensus
+bincode = "1.3"               # Efficient serialization for Raft log
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
@@ -2247,16 +2392,12 @@ criterion = "0.5"             # Benchmarking
 - ✅ **FTS**: SQLite FTS5 default, extensible via `SearchBackend` trait
 - ✅ **Encryption**: Design supports future SQLCipher (deferred implementation)
 - ✅ **Shell support**: ZSH, BASH, Nushell with shell-agnostic IPC
-- ✅ **Sync**: sqlsync with CRDTs for offline-first, real-time synchronization
-
-### Also Decided
-
-1. ✅ **Backpressure strategy**: Retry with exponential backoff (100μs, 200μs, 400μs)
-2. ✅ **Sync deployment**: P2P via libp2p (no coordinator server required)
-   - gossipsub for mutation propagation
-   - mDNS for LAN peer discovery
-   - QUIC for NAT traversal
-   - Optional signaling server only for NAT hole-punching
+- ✅ **Sync**: Raft consensus for strongly consistent replication
+- ✅ **Backpressure strategy**: Retry with exponential backoff (100μs, 200μs, 400μs)
+- ✅ **Sync deployment**: Raft P2P cluster (every machine is a peer/potential leader)
+   - `openraft` for consensus
+   - mDNS for automatic peer discovery on LAN
+   - Offline queue with replay on reconnection
 
 ### Still Open
 
@@ -2290,6 +2431,6 @@ This architecture prioritizes:
 | Read path | Left-right pattern | Wait-free queries |
 | Storage | SQLite + WAL | Reliable, portable, well-understood |
 | Search | FTS5 (extensible) | Fast full-text, graceful fallback |
-| Sync | sqlsync CRDTs | Offline-first, automatic conflict resolution |
+| Sync | Raft consensus (openraft) | Strong consistency, no conflicts, P2P |
 | Config | TOML | Human-readable, well-supported |
 | Shells | ZSH, BASH, Nushell | Cover majority of users |
