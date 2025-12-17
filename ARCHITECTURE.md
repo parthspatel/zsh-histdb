@@ -1591,6 +1591,274 @@ $env.config.hooks.env_change = {
 
 ---
 
+## Daemon Lifecycle
+
+### Startup Mechanisms
+
+**Primary**: Socket activation (systemd/launchd)
+- Zero resource usage until first shell connects
+- Automatic restart on crash
+- Proper dependency ordering
+
+**Fallback**: Shell-initiated startup
+- For Alpine/OpenRC, BSDs, or systems without service manager
+- Shell plugin checks socket, starts daemon if missing
+- PID file prevents duplicate daemons
+
+#### Platform Support
+
+| Platform | Init System | Socket Activation | Service File |
+|----------|-------------|-------------------|--------------|
+| Debian/Ubuntu | systemd | ✅ | `~/.config/systemd/user/histdb.service` |
+| Arch | systemd | ✅ | `~/.config/systemd/user/histdb.service` |
+| NixOS | systemd | ✅ | Via Home Manager |
+| Alpine | OpenRC | ❌ | Shell-initiated fallback |
+| macOS | launchd | ✅ | `~/Library/LaunchAgents/histdb.plist` |
+
+#### systemd User Service
+
+```ini
+# ~/.config/systemd/user/histdb.service
+[Unit]
+Description=histdb shell history daemon
+Documentation=https://github.com/user/histdb-rs
+
+[Service]
+Type=notify
+ExecStart=%h/.cargo/bin/histdb-daemon
+Restart=on-failure
+RestartSec=1
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/histdb %t/histdb
+
+[Install]
+WantedBy=default.target
+```
+
+```ini
+# ~/.config/systemd/user/histdb.socket
+[Unit]
+Description=histdb socket
+
+[Socket]
+ListenStream=%t/histdb.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target
+```
+
+#### launchd Service (macOS)
+
+```xml
+<!-- ~/Library/LaunchAgents/com.histdb.daemon.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.histdb.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/histdb-daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>histdb</key>
+        <dict>
+            <key>SockPathName</key>
+            <string>/tmp/histdb.sock</string>
+            <key>SockPathMode</key>
+            <integer>384</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>
+```
+
+### Shutdown Handling
+
+#### Graceful Shutdown (SIGTERM/SIGINT)
+
+```
+Signal received
+     │
+     ▼
+┌─────────────────────────┐
+│ 1. Stop accepting new   │  ← Close listener socket
+│    connections          │
+└───────────┬─────────────┘
+            ▼
+┌─────────────────────────┐
+│ 2. Drain command queue  │  ← Process remaining PendingCommands
+│    (timeout: 500ms)     │
+└───────────┬─────────────┘
+            ▼
+┌─────────────────────────┐
+│ 3. Flush final batch    │  ← Commit to SQLite
+│    to SQLite            │
+└───────────┬─────────────┘
+            ▼
+┌─────────────────────────┐
+│ 4. Best-effort sync     │  ← Push pending ops to peers
+│    (timeout: 1s)        │
+└───────────┬─────────────┘
+            ▼
+┌─────────────────────────┐
+│ 5. Cleanup              │  ← WAL checkpoint, remove socket/pidfile
+└───────────┬─────────────┘
+            ▼
+        Exit(0)
+```
+
+```rust
+// daemon/shutdown.rs
+pub struct GracefulShutdown {
+    shutdown_rx: broadcast::Receiver<()>,
+    drain_timeout: Duration,
+}
+
+impl GracefulShutdown {
+    pub async fn run(
+        &self,
+        queue: Arc<CommandQueue>,
+        writer: &mut WriterThread,
+        sync: Option<&PeerSync>,
+    ) -> Result<(), Error> {
+        // 1. Drain queue with timeout
+        let drain_result = tokio::time::timeout(
+            Duration::from_millis(500),
+            Self::drain_queue(&queue, writer)
+        ).await;
+
+        if drain_result.is_err() {
+            tracing::warn!(
+                "Queue drain timed out, {} commands may be lost",
+                queue.pending_count.load(Ordering::Relaxed)
+            );
+        }
+
+        // 2. Final SQLite flush
+        writer.flush_final()?;
+
+        // 3. Best-effort sync (don't block shutdown)
+        if let Some(sync) = sync {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                sync.push_pending()
+            ).await;
+        }
+
+        Ok(())
+    }
+}
+```
+
+#### Non-Graceful Shutdown (SIGKILL, Power Loss, Crash)
+
+| Component | Data at Risk | Recovery |
+|-----------|--------------|----------|
+| Command queue | Commands not yet batched (≤10ms) | **Lost** |
+| Current batch | Commands being written | SQLite rollback (safe) |
+| SQLite WAL | Committed transactions | Auto-recover on open |
+| Operation log | Persisted operations | Intact |
+| Left-right index | In-memory cache | Rebuild from SQLite |
+
+**Bounded data loss**: At most ~10ms of commands (one batch interval)
+
+### Crash Recovery
+
+```rust
+// daemon/recovery.rs
+impl Daemon {
+    pub fn recover_on_startup(&mut self) -> Result<(), Error> {
+        // 1. Check for stale socket
+        Self::check_stale_socket(&self.socket_path)?;
+
+        // 2. Acquire PID file
+        self.pidfile = PidFile::acquire(&self.pidfile_path)?;
+
+        // 3. Open SQLite (auto-recovers WAL)
+        let conn = Connection::open(&self.db_path)?;
+
+        // 4. Rebuild left-right index from recent history
+        let recent = conn.prepare("
+            SELECT * FROM history
+            WHERE start_time > ?1
+            ORDER BY start_time DESC
+            LIMIT ?2
+        ")?.query_map(
+            params![now() - self.config.index.max_age, self.config.index.max_entries],
+            |row| Ok(RecentEntry::from(row))
+        )?;
+
+        for entry in recent {
+            self.index_writer.insert(entry?);
+        }
+        self.index_writer.publish();
+
+        // 5. Rebuild vector clock from operation log
+        let vector_clock: HashMap<NodeId, u64> = conn.prepare("
+            SELECT origin, MAX(seq) FROM operation_log GROUP BY origin
+        ")?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+        *self.log.vector_clock.write() = vector_clock;
+
+        tracing::info!("Recovery complete: {} entries in index", self.index_writer.len());
+        Ok(())
+    }
+
+    fn check_stale_socket(path: &Path) -> Result<(), Error> {
+        if path.exists() {
+            match UnixStream::connect(path) {
+                Ok(_) => return Err(Error::DaemonAlreadyRunning),
+                Err(_) => {
+                    std::fs::remove_file(path)?;
+                    tracing::info!("Removed stale socket");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+### Reliability Guarantees
+
+| Scenario | Data Loss | Recovery Time |
+|----------|-----------|---------------|
+| Graceful shutdown | None | Instant |
+| SIGKILL | ≤10ms of commands | ~100ms (index rebuild) |
+| Power loss | ≤10ms of commands | ~100ms |
+| Daemon crash | ≤10ms of commands | Auto-restart via systemd |
+| Corrupt database | All local data | Restore from sync peer |
+
+### Optional Durable Mode
+
+For users requiring zero data loss (at cost of latency):
+
+```toml
+# ~/.config/histdb/config.toml
+[daemon]
+# "fast" = ack before persist (default, <1ms, may lose ≤10ms on crash)
+# "durable" = ack after persist (~5-10ms, crash-safe)
+ack_mode = "fast"
+```
+
+---
+
 ## Synchronization Architecture (Hybrid: Raft Log Replication + CRDT Semantics)
 
 A hybrid approach combining **Raft-style log replication** for efficient message passing with **CRDT semantics** for conflict-free offline operation. Every machine is a full peer—no coordination server required.
@@ -2426,6 +2694,11 @@ criterion = "0.5"             # Benchmarking
    - More reliable than session + heuristic approach
    - Explicit correlation prevents wrong entry updates
    - Shell stores ID in variable, passes back to FinishCommand
+- ✅ **Daemon lifecycle**: systemd/launchd socket activation with shell-initiated fallback
+   - Primary: Socket activation (zero resources until first connection)
+   - Fallback: Shell starts daemon if socket missing (Alpine, BSDs)
+   - Graceful shutdown drains queue, flushes SQLite, syncs peers
+   - Crash recovery: ≤10ms data loss, auto-restart, index rebuild from SQLite
 
 ### Still Open
 
@@ -2444,7 +2717,7 @@ This architecture prioritizes:
 - **Performance**: Lock-free writes, wait-free reads (left-right), batched SQLite operations
 - **Correctness**: Transaction safety, comprehensive testing, atomic migrations
 - **Extensibility**: Pluggable search backends, multi-shell support, encryption-ready
-- **Sync**: Offline-first CRDT synchronization via sqlsync
+- **Sync**: Offline-first hybrid sync (Raft log replication + CRDT semantics)
 - **Maintainability**: Clean separation of concerns, well-defined interfaces
 
 ### Key Design Decisions
