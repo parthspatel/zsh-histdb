@@ -3273,6 +3273,354 @@ min_version = "0.1"
 warn_degraded = true
 ```
 
+### Data Retention & Pruning
+
+Configurable limits and strategies to manage history growth.
+
+#### Retention Limits
+
+```toml
+# ~/.config/histdb/config.toml
+
+[retention]
+# ═══════════════════════════════════════════════════════════════════
+# Limits (all optional, set to 0 or "unlimited" to disable)
+# ═══════════════════════════════════════════════════════════════════
+
+# Age-based: commands older than this are candidates for pruning
+max_age = "365d"
+
+# Per-host: prevents one busy machine from dominating history
+max_commands_per_host = 100000
+
+# Global: total commands across all hosts
+max_commands_total = 1000000
+
+# Size-based: hard cap on database size
+max_database_size = "1GB"
+
+# ═══════════════════════════════════════════════════════════════════
+# Strategy: how to choose which commands to prune
+# ═══════════════════════════════════════════════════════════════════
+strategy = "smart"  # "oldest" | "lru" | "lfu" | "smart"
+
+# ═══════════════════════════════════════════════════════════════════
+# Protection: commands matching these criteria are never pruned
+# ═══════════════════════════════════════════════════════════════════
+preserve_starred = true       # User-starred commands
+preserve_failed = false       # Commands with non-zero exit status
+preserve_long_running = "5m"  # Commands that took longer than this
+preserve_patterns = [         # Regex patterns to always keep
+    "^git commit",
+    "^docker run",
+    "^kubectl apply",
+]
+
+# ═══════════════════════════════════════════════════════════════════
+# Pruning behavior
+# ═══════════════════════════════════════════════════════════════════
+prune_interval = "1h"         # How often to check limits
+prune_batch_size = 1000       # Commands to delete per batch
+```
+
+#### Retention Strategies
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Retention Strategies                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────┐                                                            │
+│  │   oldest    │  Prune by age only (simplest)                              │
+│  └─────────────┘  Score = -start_time                                       │
+│                   Good for: Simple setups, predictable behavior             │
+│                                                                              │
+│  ┌─────────────┐                                                            │
+│  │     lru     │  Least Recently Used                                       │
+│  └─────────────┘  Score = -last_used_time                                   │
+│                   Good for: Keeping recently relevant commands              │
+│                   Requires: tracking last search/execution time             │
+│                                                                              │
+│  ┌─────────────┐                                                            │
+│  │     lfu     │  Least Frequently Used                                     │
+│  └─────────────┘  Score = -use_count                                        │
+│                   Good for: Keeping frequently used commands                │
+│                   Requires: tracking execution/search count                 │
+│                                                                              │
+│  ┌─────────────┐                                                            │
+│  │    smart    │  Weighted combination (recommended)                        │
+│  └─────────────┘  Score = w1*age + w2*recency + w3*frequency + w4*length   │
+│                   Good for: Balanced pruning based on actual value          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Smart Strategy Scoring
+
+The `smart` strategy computes a **retention score** for each command:
+
+```rust
+// retention/strategy.rs
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SmartWeights {
+    pub age: f64,           // How old the command is (default: 0.3)
+    pub recency: f64,       // Time since last use (default: 0.3)
+    pub frequency: f64,     // How often used (default: 0.25)
+    pub complexity: f64,    // Command length/complexity (default: 0.15)
+}
+
+impl Default for SmartWeights {
+    fn default() -> Self {
+        Self { age: 0.3, recency: 0.3, frequency: 0.25, complexity: 0.15 }
+    }
+}
+
+/// Lower score = more likely to be pruned
+pub fn compute_retention_score(entry: &HistoryEntry, weights: &SmartWeights) -> f64 {
+    let now = Utc::now();
+
+    // Age factor: older = lower score (0.0 to 1.0)
+    let age_days = (now - entry.start_time).num_days() as f64;
+    let age_score = 1.0 / (1.0 + age_days / 365.0);  // Half-life of ~1 year
+
+    // Recency factor: recently used = higher score
+    let recency_days = entry.last_used
+        .map(|t| (now - t).num_days() as f64)
+        .unwrap_or(age_days);  // Fall back to age if never reused
+    let recency_score = 1.0 / (1.0 + recency_days / 30.0);  // Half-life of ~1 month
+
+    // Frequency factor: more uses = higher score
+    let frequency_score = (entry.use_count as f64).ln_1p() / 10.0;  // Log scale
+
+    // Complexity factor: longer/complex commands = higher score (worth keeping)
+    let complexity_score = (entry.command.len() as f64).ln_1p() / 10.0;
+
+    // Weighted sum
+    weights.age * age_score
+        + weights.recency * recency_score
+        + weights.frequency * frequency_score
+        + weights.complexity * complexity_score
+}
+```
+
+**Configuration for smart strategy:**
+
+```toml
+[retention]
+strategy = "smart"
+
+[retention.smart_weights]
+age = 0.3           # 30% weight on command age
+recency = 0.3       # 30% weight on last use time
+frequency = 0.25    # 25% weight on use count
+complexity = 0.15   # 15% weight on command length
+```
+
+#### Usage Tracking
+
+To support LRU/LFU/Smart strategies, track command usage:
+
+```sql
+-- Schema additions
+ALTER TABLE history ADD COLUMN use_count INTEGER DEFAULT 1;
+ALTER TABLE history ADD COLUMN last_used INTEGER;  -- Unix timestamp
+
+CREATE INDEX history_use_count ON history(use_count);
+CREATE INDEX history_last_used ON history(last_used);
+```
+
+```rust
+// Update on search result selection or re-execution
+pub fn record_command_use(&self, uuid: Uuid) -> Result<(), Error> {
+    self.conn.execute("
+        UPDATE history
+        SET use_count = use_count + 1, last_used = ?1
+        WHERE uuid = ?2
+    ", params![Utc::now().timestamp(), uuid])?;
+
+    // Also create CRDT operation to sync usage stats
+    let op = Operation::UpdateUsage {
+        entry_id: uuid,
+        use_count: LWWRegister::new(/* ... */),
+        last_used: LWWRegister::new(/* ... */),
+    };
+    self.log.append(op)?;
+
+    Ok(())
+}
+```
+
+#### Pruning Implementation
+
+```rust
+// retention/pruner.rs
+
+pub struct Pruner {
+    config: RetentionConfig,
+    strategy: Box<dyn PruneStrategy>,
+}
+
+pub trait PruneStrategy: Send + Sync {
+    fn get_prune_candidates(
+        &self,
+        conn: &Connection,
+        limit: usize,
+        protected: &ProtectionRules,
+    ) -> Result<Vec<Uuid>, Error>;
+}
+
+impl Pruner {
+    pub async fn run_prune_cycle(&self) -> Result<PruneStats, Error> {
+        let mut stats = PruneStats::default();
+
+        // Check if any limits exceeded
+        let status = self.check_limits()?;
+        if !status.needs_pruning {
+            return Ok(stats);
+        }
+
+        // Get candidates based on strategy
+        let candidates = self.strategy.get_prune_candidates(
+            &self.conn,
+            status.prune_target,
+            &self.config.protection,
+        )?;
+
+        // Prune in batches
+        for batch in candidates.chunks(self.config.prune_batch_size) {
+            for uuid in batch {
+                // Create tombstone (syncs to peers)
+                let op = Operation::Delete {
+                    entry_id: *uuid,
+                    timestamp: self.hlc.now(),
+                };
+                self.log.append(op)?;
+                stats.pruned += 1;
+            }
+
+            // Yield between batches
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(
+            "Pruned {} commands (strategy: {:?})",
+            stats.pruned,
+            self.config.strategy
+        );
+
+        Ok(stats)
+    }
+}
+
+// Strategy implementations
+pub struct OldestStrategy;
+
+impl PruneStrategy for OldestStrategy {
+    fn get_prune_candidates(
+        &self,
+        conn: &Connection,
+        limit: usize,
+        protected: &ProtectionRules,
+    ) -> Result<Vec<Uuid>, Error> {
+        conn.prepare("
+            SELECT uuid FROM history
+            WHERE starred = 0
+              AND (exit_status = 0 OR ?1 = 0)
+              AND NOT matches_protected_pattern(command)
+            ORDER BY start_time ASC
+            LIMIT ?2
+        ")?.query_map(
+            params![protected.preserve_failed as i32, limit],
+            |row| row.get(0)
+        )?.collect()
+    }
+}
+
+pub struct SmartStrategy {
+    weights: SmartWeights,
+}
+
+impl PruneStrategy for SmartStrategy {
+    fn get_prune_candidates(
+        &self,
+        conn: &Connection,
+        limit: usize,
+        protected: &ProtectionRules,
+    ) -> Result<Vec<Uuid>, Error> {
+        // Compute scores and get lowest-scored entries
+        let mut entries: Vec<(Uuid, f64)> = conn.prepare("
+            SELECT uuid, start_time, last_used, use_count, length(command)
+            FROM history
+            WHERE starred = 0
+              AND (exit_status = 0 OR ?1 = 0)
+        ")?.query_map(
+            params![protected.preserve_failed as i32],
+            |row| {
+                let uuid: Uuid = row.get(0)?;
+                let entry = HistoryEntry {
+                    start_time: row.get(1)?,
+                    last_used: row.get(2)?,
+                    use_count: row.get(3)?,
+                    command_len: row.get(4)?,
+                };
+                let score = compute_retention_score(&entry, &self.weights);
+                Ok((uuid, score))
+            }
+        )?.collect::<Result<_, _>>()?;
+
+        // Sort by score ascending (lowest = prune first)
+        entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        Ok(entries.into_iter().take(limit).map(|(uuid, _)| uuid).collect())
+    }
+}
+```
+
+#### Starred Commands
+
+Users can protect important commands from pruning:
+
+```bash
+# Star a command (by search)
+$ histdb star "docker run"
+Starred: docker run -v /var/run/docker.sock...
+
+# Star by ID
+$ histdb star --id 550e8400-e29b-41d4-a716-446655440000
+
+# List starred
+$ histdb list --starred
+
+# Unstar
+$ histdb unstar "docker run"
+```
+
+#### Sync Considerations
+
+| Scenario | Behavior |
+|----------|----------|
+| **Different retention settings** | Deletes sync (most restrictive wins) |
+| **Starred on host A, pruned on B** | Star should sync first; if not, conflict resolution needed |
+| **Usage stats sync** | LWW-Register for use_count and last_used |
+| **Offline host reconnects** | Receives tombstones, prunes locally |
+
+**Conflict resolution for starred:**
+
+```rust
+// Starred flag uses LWW with bias toward preservation
+pub fn merge_starred(local: &LWWRegister<bool>, remote: &LWWRegister<bool>) -> bool {
+    if local.timestamp == remote.timestamp {
+        // Tie-breaker: preserve (starred = true) wins
+        local.value || remote.value
+    } else if local.timestamp > remote.timestamp {
+        local.value
+    } else {
+        remote.value
+    }
+}
+```
+
 ---
 
 ## Error Handling
@@ -3493,6 +3841,13 @@ criterion = "0.5"             # Benchmarking
    - Support current + previous major version (rolling upgrades)
    - Graceful degradation for mixed-version clusters
    - Forward-compatible messages via `#[serde(default)]`
+- ✅ **Data retention**: Configurable limits with smart pruning strategies
+   - Per-host limit (default: 100k commands) prevents domination
+   - Global limit (default: 1M commands) caps total storage
+   - Age limit (default: 365 days) auto-expires old commands
+   - Strategies: oldest, LRU, LFU, smart (weighted scoring)
+   - Protected commands: starred, long-running, pattern-matched
+   - Usage tracking (use_count, last_used) for smart pruning
 
 ### Still Open
 
