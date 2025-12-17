@@ -2683,39 +2683,330 @@ CREATE INDEX IF NOT EXISTS history_uuid ON history(uuid);
 CREATE INDEX IF NOT EXISTS history_hlc ON history(hlc_wall, hlc_logical);
 ```
 
-### Configuration
+### Sync Security (Noise Protocol + Ed25519)
+
+All sync traffic is encrypted and authenticated using the **Noise Protocol Framework** with Ed25519 keys (same format as SSH keys).
+
+#### Security Properties
+
+| Property | Guaranteed |
+|----------|------------|
+| **Encryption** | ✅ ChaCha20-Poly1305 |
+| **Mutual Authentication** | ✅ Both peers verified via Ed25519 |
+| **Forward Secrecy** | ✅ Ephemeral key exchange |
+| **Replay Protection** | ✅ Nonces |
+| **Unknown Peer Rejection** | ✅ Must be in known peers list |
+
+#### Implementation
+
+```rust
+// sync/crypto.rs
+use snow::{Builder, TransportState};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+
+/// Noise protocol pattern: KK (both sides know each other's static key)
+const NOISE_PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
+
+pub struct SecureChannel {
+    transport: TransportState,
+    peer_pubkey: VerifyingKey,
+}
+
+impl SecureChannel {
+    /// Initiate connection to known peer
+    pub fn connect(
+        our_key: &SigningKey,
+        peer_pubkey: &VerifyingKey,
+        stream: TcpStream,
+    ) -> Result<Self, Error> {
+        let builder = Builder::new(NOISE_PATTERN.parse()?)
+            .local_private_key(&our_key.to_bytes())
+            .remote_public_key(&peer_pubkey.to_bytes());
+
+        let mut handshake = builder.build_initiator()?;
+
+        // Two-round handshake
+        let mut buf = [0u8; 65535];
+        let len = handshake.write_message(&[], &mut buf)?;
+        stream.write_all(&buf[..len])?;
+
+        let len = stream.read(&mut buf)?;
+        handshake.read_message(&buf[..len], &mut [])?;
+
+        let transport = handshake.into_transport_mode()?;
+        Ok(Self { transport, peer_pubkey: *peer_pubkey })
+    }
+
+    /// Accept connection, verify peer is in known_peers list
+    pub fn accept(
+        our_key: &SigningKey,
+        known_peers: &[VerifyingKey],
+        stream: TcpStream,
+    ) -> Result<Self, Error> {
+        let builder = Builder::new(NOISE_PATTERN.parse()?)
+            .local_private_key(&our_key.to_bytes());
+
+        let mut handshake = builder.build_responder()?;
+
+        let mut buf = [0u8; 65535];
+        let len = stream.read(&mut buf)?;
+        handshake.read_message(&buf[..len], &mut [])?;
+
+        // Verify peer is in known_peers list
+        let peer_pubkey = handshake.get_remote_static().ok_or(Error::NoPeerKey)?;
+        let peer_key = VerifyingKey::from_bytes(peer_pubkey.try_into()?)?;
+
+        if !known_peers.contains(&peer_key) {
+            return Err(Error::UnknownPeer);
+        }
+
+        let len = handshake.write_message(&[], &mut buf)?;
+        stream.write_all(&buf[..len])?;
+
+        let transport = handshake.into_transport_mode()?;
+        Ok(Self { transport, peer_pubkey: peer_key })
+    }
+}
+```
+
+#### Key Management CLI
+
+```bash
+# Generate new identity
+$ histdb keys init
+Generated: ~/.config/histdb/identity.key
+Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGwZ...
+
+# Or import from existing SSH key
+$ histdb keys init --from-ssh ~/.ssh/id_ed25519
+
+# Export for Codespaces/K8s secrets
+$ histdb keys export --format=base64
+HISTDB_IDENTITY=LS0tLS1CRUdJTi...
+
+# Add trusted peer
+$ histdb peers add laptop "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHxK..."
+
+# List peers
+$ histdb peers list
+```
+
+### Sync Topology
+
+Two deployment models supported:
+
+#### Model 1: Full P2P Mesh (Static Machines Only)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│      ┌──────────┐         ┌──────────┐         ┌──────────┐    │
+│      │  Laptop  │◄───────►│  Desktop │◄───────►│  Server  │    │
+│      │ (static) │         │ (static) │         │ (static) │    │
+│      └────┬─────┘         └────┬─────┘         └────┬─────┘    │
+│           └────────────────────┴────────────────────┘           │
+│                    Full mesh (all in peers.toml)                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Model 2: Hub-Spoke with Leader Election (Static + Ephemeral)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│   Static Machines (leader election cluster)                                  │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                     │
+│   │   Desktop   │◄──►│   Laptop    │◄──►│   Server    │  ← P2P mesh         │
+│   │ priority=75 │    │ priority=50 │    │ priority=100│                     │
+│   └─────────────┘    └─────────────┘    └──────┬──────┘                     │
+│                                                │                             │
+│                                    Current Leader                            │
+│                                    (highest priority)                        │
+│                                                │                             │
+│              ┌─────────────────────────────────┼─────────────────┐          │
+│              ▼                                 ▼                 ▼          │
+│       ┌────────────┐                   ┌────────────┐    ┌────────────┐     │
+│       │ Codespace  │                   │  K8s Pod   │    │  Temp VM   │     │
+│       │ (ephemeral)│                   │ (ephemeral)│    │ (ephemeral)│     │
+│       └────────────┘                   └────────────┘    └────────────┘     │
+│                                                                              │
+│   Failover: Server dies → Desktop (priority=75) becomes leader              │
+│             Ephemeral machines auto-reconnect to new leader                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Leader Election
+
+Simple Bully Algorithm for small clusters:
+
+```rust
+// sync/election.rs
+pub struct Election {
+    our_id: NodeId,
+    our_priority: u32,
+    peers: HashMap<NodeId, PeerState>,
+    current_leader: Option<NodeId>,
+}
+
+impl Election {
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+    const LEADER_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// We're leader if highest priority among reachable static peers
+    pub fn should_be_leader(&self) -> bool {
+        let dominated_by = self.peers.values()
+            .filter(|p| p.is_static && p.last_seen.elapsed() < Self::LEADER_TIMEOUT)
+            .any(|p| p.priority > self.our_priority);
+        !dominated_by
+    }
+
+    pub fn on_heartbeat(&mut self, from: NodeId, msg: Heartbeat) {
+        self.peers.insert(from, PeerState {
+            priority: msg.priority,
+            last_seen: Instant::now(),
+            is_static: msg.is_static,
+        });
+
+        if self.should_be_leader() {
+            self.current_leader = Some(self.our_id);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Heartbeat {
+    pub node_id: NodeId,
+    pub priority: u32,
+    pub is_leader: bool,
+    pub is_static: bool,
+    pub leader_addr: Option<SocketAddr>,
+}
+```
+
+#### Failover Timeline
+
+```
+0s      Server (priority=100) is leader, Codespace connected
+10s     Server crashes 💥
+15s     Desktop/Laptop miss heartbeats, Desktop (priority=75) becomes leader
+16s     Codespace reconnects to Desktop via mDNS discovery
+17s     Sync continues (CRDTs merge any divergence)
+```
+
+### Ephemeral Machine Support
+
+#### Portable Identity (Personal Use)
+
+Store identity key in secrets — same key across all Codespaces/K8s pods:
+
+```yaml
+# GitHub Codespaces: Settings → Secrets
+HISTDB_IDENTITY: <base64 private key>
+
+# K8s Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: histdb-identity
+data:
+  identity.key: <base64 private key>
+```
+
+One peer entry covers all ephemeral machines:
 
 ```toml
-# ~/.config/histdb/config.toml
+# On static peers
+[[sync.peers]]
+name = "my-ephemeral"
+public_key = "ssh-ed25519 AAAAC3..."
+addresses = []  # Ephemeral connects OUT
+role = "ephemeral"
+```
+
+#### Token Enrollment (Team Use)
+
+```bash
+# On static machine
+$ histdb tokens create --name="new-dev" --expires=1h
+Token: hdb_enroll_7f3a9b2c...
+
+# On new machine
+$ histdb sync enroll hdb_enroll_7f3a9b2c...
+✓ Enrolled with home.example.com
+```
+
+### Configuration (Complete)
+
+```toml
+# ═══════════════════════════════════════════════════════════════════
+# STATIC MACHINE (~/.config/histdb/config.toml)
+# ═══════════════════════════════════════════════════════════════════
 
 [sync]
 enabled = true
-# Unique node ID (auto-generated from machine-id if not set)
-# node_id = 1
-
-# Listen address for sync
+mode = "static"
 listen_addr = "0.0.0.0:4242"
 
-[sync.replication]
-# Eager push to peers on write
-eager_push = true
-# Anti-entropy sync interval (seconds)
-sync_interval = 30
-# Max entries per sync batch
-batch_size = 1000
+[sync.identity]
+private_key_path = "~/.config/histdb/identity.key"
 
-[sync.peers]
-# Static peer list (in addition to mDNS discovery)
-bootstrap = [
-    "192.168.1.100:4242",
-    "192.168.1.101:4242",
-]
+[sync.cluster]
+priority = 100  # Higher = more likely leader (100 for servers, 50 for laptops)
+
+[sync.replication]
+eager_push = true
+sync_interval = 30
+batch_size = 1000
+heartbeat_interval = 5
+leader_timeout = 15
 
 [sync.discovery]
-# Enable mDNS for automatic peer discovery on LAN
 mdns_enabled = true
-# Service name for mDNS
 mdns_service = "_histdb._tcp.local"
+
+[sync.ephemeral]
+accept_ephemeral = true
+
+# ─────────────────────────────────────────────────────────────────
+# Peer definitions (or in ~/.config/histdb/peers.toml)
+# ─────────────────────────────────────────────────────────────────
+
+[[sync.peers]]
+name = "laptop"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHxK..."
+addresses = ["192.168.1.100:4242", "laptop.local:4242"]
+role = "static"
+priority = 50
+
+[[sync.peers]]
+name = "desktop"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPqR..."
+addresses = ["192.168.1.101:4242"]
+role = "static"
+priority = 75
+
+[[sync.peers]]
+name = "my-ephemeral"
+public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGwZ..."
+addresses = []
+role = "ephemeral"
+```
+
+```toml
+# ═══════════════════════════════════════════════════════════════════
+# EPHEMERAL MACHINE (Codespaces, K8s)
+# ═══════════════════════════════════════════════════════════════════
+
+[sync]
+enabled = true
+mode = "ephemeral"
+
+[sync.identity]
+from_env = "HISTDB_IDENTITY"
+
+[sync.connect]
+bootstrap_peers = ["home.example.com:4242"]
+mdns_service = "_histdb._tcp.local"
+reconnect_delay = "1s"
+max_reconnect_delay = "30s"
 ```
 
 ### Consistency Guarantees
@@ -2859,6 +3150,13 @@ parking_lot = "0.12"          # Fast mutexes (for non-hot paths only)
 # Hybrid sync (CRDT + log replication)
 bincode = "1.3"               # Efficient serialization for operation log
 
+# Sync security & networking
+snow = "0.9"                  # Noise Protocol Framework
+ed25519-dalek = "2"           # Ed25519 signatures (SSH key compatible)
+x25519-dalek = "2"            # X25519 key exchange
+mdns-sd = "0.10"              # mDNS for peer discovery
+base64 = "0.21"               # Key encoding for secrets
+
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
 
@@ -2928,6 +3226,20 @@ criterion = "0.5"             # Benchmarking
    - Shell queues commands to `~/.local/share/histdb/offline.db`
    - Replay to daemon on reconnect
    - Near 100% reliability (no lost commands)
+- ✅ **Sync security**: Noise Protocol with Ed25519 keys
+   - ChaCha20-Poly1305 encryption, mutual authentication
+   - Forward secrecy via ephemeral key exchange
+   - SSH key format compatible (can reuse `~/.ssh/id_ed25519`)
+   - Only registered peers in `peers.toml` can connect
+- ✅ **Sync topology**: Dual-mode (P2P mesh + Hub-spoke with leader election)
+   - Static machines: Full P2P mesh, participate in leader election
+   - Ephemeral machines: Connect to current leader only
+   - Leader election: Bully algorithm, highest-priority static node wins
+   - Automatic failover: ~15s detection, ephemeral auto-reconnect
+- ✅ **Ephemeral machine support**: Portable identity + token enrollment
+   - Portable identity: Store key in Codespaces/K8s secrets
+   - Token enrollment: One-time tokens for team/shared environments
+   - One peer entry covers all machines with same identity
 
 ### Still Open
 
