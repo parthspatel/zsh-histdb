@@ -3034,6 +3034,245 @@ After reconnect:
 - HLC ensures causal ordering for queries
 ```
 
+### Session ID Generation
+
+Shells generate their own session IDs using **UUIDv7** — no daemon round-trip required.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    UUIDv7 Structure                              │
+├─────────────────────────────────────────────────────────────────┤
+│  48-bit timestamp (ms)  │  4-bit ver  │  12-bit random  │ ...  │
+│  ──────────────────────   ──────────   ────────────────         │
+│  Time-ordered for        Fixed "7"    Uniqueness even           │
+│  efficient queries                    with shared identity      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why UUIDv7:**
+- **Works with offline queue**: Shell generates ID without daemon
+- **Shared identity safe**: Random component ensures uniqueness when multiple Codespaces share same identity key
+- **Time-ordered**: Efficient for "most recent session" queries
+- **Zero coordination**: No round-trip, no leader involvement
+
+```rust
+// Shell generates on startup (or shell plugin)
+let session_id = Uuid::now_v7();
+
+// In ZSH plugin
+typeset -g HISTDB_SESSION=$(uuidgen -r)  # Or use histdb-cli helper
+```
+
+### Log Compaction
+
+Tiered compaction strategy that doesn't let ephemeral peers block garbage collection.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Log Compaction Strategy                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Operation Log Entry                                                    │
+│          │                                                               │
+│          ▼                                                               │
+│   ┌──────────────────┐                                                  │
+│   │ Applied to local │                                                  │
+│   │ SQLite state?    │                                                  │
+│   └────────┬─────────┘                                                  │
+│            │ yes                                                         │
+│            ▼                                                             │
+│   ┌──────────────────┐     no      ┌────────────────────┐               │
+│   │ All STATIC peers │ ──────────► │ Keep in log        │               │
+│   │ ACKed?           │             │ (still replicating)│               │
+│   └────────┬─────────┘             └────────────────────┘               │
+│            │ yes                                                         │
+│            ▼                                                             │
+│   ┌──────────────────┐     OR      ┌────────────────────┐               │
+│   │ COMPACT          │ ◄────────── │ Age > max_log_age  │               │
+│   │ (remove from log)│             │ (default: 90 days) │               │
+│   └──────────────────┘             └────────────────────┘               │
+│                                                                          │
+│   Ephemeral peers: Ignored for compaction (sync on connect)             │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Compaction rules:**
+
+| Component | Rule | Default |
+|-----------|------|---------|
+| **Operation log** | Remove when all static peers ACK, OR older than max age | 90 days |
+| **Tombstones** | Keep for TTL, then hard-delete | 30 days |
+| **Entries** | Never compact (actual data) | — |
+| **Ephemeral peer state** | Expire tracking after inactivity | 24 hours |
+
+**Implementation:**
+
+```rust
+// sync/compaction.rs
+impl CompactionStrategy {
+    pub fn can_compact(&self, entry: &LogEntry, peer_acks: &HashMap<NodeId, u64>) -> bool {
+        // Rule 1: All static peers have ACKed
+        let static_peers_acked = self.static_peers.iter()
+            .all(|peer| peer_acks.get(peer).copied().unwrap_or(0) >= entry.seq);
+
+        if static_peers_acked {
+            return true;
+        }
+
+        // Rule 2: Entry older than max_log_age (fallback for long-offline peers)
+        let age = Utc::now() - entry.timestamp.to_datetime();
+        if age > self.config.max_log_age {
+            return true;
+        }
+
+        false // Ephemeral peers not considered
+    }
+}
+```
+
+**Long-offline peer reconnection:**
+
+```rust
+// If peer's vector clock is too old, trigger full state sync
+pub async fn sync_with_peer(&self, peer: &PeerConnection) -> Result<SyncResult, Error> {
+    let their_vc = peer.get_vector_clock().await?;
+    let our_oldest_log = self.log.oldest_entry_seq()?;
+
+    let needs_full_sync = their_vc.values().any(|&seq| seq < our_oldest_log);
+
+    if needs_full_sync {
+        tracing::info!("Peer too far behind, initiating full state sync");
+        self.full_state_sync(peer).await
+    } else {
+        self.delta_sync(peer, &their_vc).await
+    }
+}
+```
+
+### Protocol Versioning
+
+Semantic versioning with one-version backward compatibility window for rolling upgrades.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      Protocol Version Strategy                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Version Format: MAJOR.MINOR                                           │
+│                                                                          │
+│   MAJOR (breaking):              MINOR (additive):                      │
+│   - Changed message structure    - New optional fields                  │
+│   - Removed fields               - New message types                    │
+│   - Changed semantics            - New enum variants                    │
+│                                                                          │
+│   Compatibility: abs(our.major - their.major) <= 1                      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Handshake with version negotiation:**
+
+```rust
+// sync/protocol.rs
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl ProtocolVersion {
+    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+
+    pub fn compatible_with(&self, other: &Self) -> Compatibility {
+        match (self.major as i32 - other.major as i32).abs() {
+            0 => Compatibility::Full,
+            1 => Compatibility::Degraded,
+            _ => Compatibility::Incompatible,
+        }
+    }
+}
+
+pub enum Compatibility {
+    Full,         // Same major, use all features
+    Degraded,     // ±1 major, use common subset
+    Incompatible, // Reject connection
+}
+
+/// First message after Noise handshake
+#[derive(Serialize, Deserialize)]
+pub struct Hello {
+    pub protocol_version: ProtocolVersion,
+    pub node_id: NodeId,
+    pub capabilities: Capabilities,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct Capabilities {
+    #[serde(default)]
+    pub supports_compression: bool,
+    #[serde(default)]
+    pub supports_batched_sync: bool,
+}
+```
+
+**Connection handling:**
+
+```rust
+impl PeerConnection {
+    pub async fn negotiate_version(&mut self, their_hello: &Hello) -> Result<(), Error> {
+        match ProtocolVersion::CURRENT.compatible_with(&their_hello.protocol_version) {
+            Compatibility::Full => {
+                self.negotiated_version = ProtocolVersion::CURRENT;
+            }
+            Compatibility::Degraded => {
+                self.negotiated_version = their_hello.protocol_version
+                    .min(ProtocolVersion::CURRENT);
+                tracing::warn!(
+                    "Peer using older protocol {:?}, degraded mode",
+                    self.negotiated_version
+                );
+            }
+            Compatibility::Incompatible => {
+                return Err(Error::IncompatibleProtocol {
+                    ours: ProtocolVersion::CURRENT,
+                    theirs: their_hello.protocol_version,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+**Forward-compatible message design:**
+
+```rust
+// Always use Option + #[serde(default)] for new fields
+#[derive(Serialize, Deserialize)]
+pub struct SyncMessage {
+    pub entries: Vec<LogEntry>,
+    pub vector_clock: HashMap<NodeId, u64>,
+
+    #[serde(default)]  // v1.1: older peers ignore
+    pub compression: Option<CompressionType>,
+
+    #[serde(default)]  // v1.2: older peers ignore
+    pub checksum: Option<u64>,
+}
+```
+
+**Configuration:**
+
+```toml
+[sync.protocol]
+# Minimum peer version to accept (default: current.major - 1)
+min_version = "0.1"
+# Warn when connecting to older peers
+warn_degraded = true
+```
+
 ---
 
 ## Error Handling
@@ -3240,10 +3479,24 @@ criterion = "0.5"             # Benchmarking
    - Portable identity: Store key in Codespaces/K8s secrets
    - Token enrollment: One-time tokens for team/shared environments
    - One peer entry covers all machines with same identity
+- ✅ **Session ID generation**: Shell generates UUIDv7
+   - Works with offline queue (no daemon round-trip needed)
+   - Safe with shared portable identity (random component ensures uniqueness)
+   - Time-ordered for efficient queries
+- ✅ **Log compaction**: Tiered strategy with peer-class awareness
+   - Compact when all static peers ACK, OR entry older than 90 days
+   - Ephemeral peers don't block compaction
+   - Long-offline peers get full state sync instead of delta
+   - Tombstones expire after 30 days
+- ✅ **Protocol versioning**: Semantic versioning with ±1 major compatibility
+   - MAJOR.MINOR format, breaking vs additive changes
+   - Support current + previous major version (rolling upgrades)
+   - Graceful degradation for mixed-version clusters
+   - Forward-compatible messages via `#[serde(default)]`
 
 ### Still Open
 
-(No critical questions remaining - ready for implementation review)
+(All questions decided - ready for implementation)
 
 ---
 
