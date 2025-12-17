@@ -2422,14 +2422,14 @@ criterion = "0.5"             # Benchmarking
    - CRDT merge semantics (always-writable, auto-converge)
    - Hybrid Logical Clocks for causal ordering
    - mDNS for automatic peer discovery on LAN
+- ✅ **History ID correlation**: Shell tracks returned ID from StartCommand
+   - More reliable than session + heuristic approach
+   - Explicit correlation prevents wrong entry updates
+   - Shell stores ID in variable, passes back to FinishCommand
 
 ### Still Open
 
-1. **History ID correlation**: For `FinishCommand`:
-   - Shell tracks returned ID (more reliable) ← **Recommended**
-   - Session + "most recent" heuristic (simpler shell code)
-
-2. **Import tool priority**: Which formats to support first?
+1. **Import tool priority**: Which formats to support first?
    - zsh-histdb SQLite (migration)
    - .zsh_history / .bash_history (plain text)
    - atuin SQLite
