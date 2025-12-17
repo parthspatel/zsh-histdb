@@ -78,11 +78,17 @@ histdb-rs/
 │   │   │   │   ├── query.rs      # Query history (via left-right)
 │   │   │   │   ├── forget.rs     # Delete history
 │   │   │   │   └── stats.rs      # Statistics
-│   │   │   ├── sync/             # CRDT synchronization (sqlsync)
+│   │   │   ├── sync/             # Hybrid sync (log replication + CRDTs)
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── mutations.rs  # CRDT mutation types
-│   │   │   │   ├── reducer.rs    # sqlsync reducer
-│   │   │   │   └── worker.rs     # Background sync worker
+│   │   │   │   ├── hlc.rs        # Hybrid Logical Clock
+│   │   │   │   ├── crdt.rs       # CRDT types (G-Set, LWW-Register)
+│   │   │   │   ├── log.rs        # Operation log (append-only)
+│   │   │   │   ├── protocol.rs   # Sync protocol messages
+│   │   │   │   └── peer.rs       # Peer connection management
+│   │   │   ├── import/           # Import backends (extensible)
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── traits.rs     # ImportBackend trait
+│   │   │   │   └── new.rs        # NewInstance (fresh DB)
 │   │   │   ├── config.rs         # TOML configuration
 │   │   │   └── error.rs          # Error types
 │   │   └── Cargo.toml
@@ -1233,7 +1239,87 @@ pub struct QueryArgs {
 
 ---
 
-### 6. Extensible Search Backend (`histdb-core/src/search/`)
+### 6. Import Interface (`histdb-core/src/import/`)
+
+Trait-based design for future extensibility, with a minimal initial implementation:
+
+```rust
+// import/traits.rs
+use crate::db::Connection;
+use crate::error::Error;
+
+/// Import backend trait - allows plugging in different import sources
+pub trait ImportBackend: Send + Sync {
+    /// Human-readable name for this importer
+    fn name(&self) -> &'static str;
+
+    /// Check if this backend can import from the given path
+    fn can_import(&self, path: &Path) -> bool;
+
+    /// Import history entries from source into the database
+    fn import(
+        &self,
+        source: &Path,
+        conn: &mut Connection,
+        progress: Option<&dyn ImportProgress>,
+    ) -> Result<ImportStats, Error>;
+}
+
+/// Progress callback for long-running imports
+pub trait ImportProgress: Send + Sync {
+    fn on_progress(&self, imported: usize, total: Option<usize>);
+    fn on_skip(&self, reason: &str);
+}
+
+/// Statistics from an import operation
+#[derive(Debug, Default)]
+pub struct ImportStats {
+    pub entries_imported: usize,
+    pub entries_skipped: usize,
+    pub duplicates_found: usize,
+}
+
+// import/new_instance.rs - Default implementation
+/// Creates a fresh database instance (no import)
+pub struct NewInstance;
+
+impl ImportBackend for NewInstance {
+    fn name(&self) -> &'static str {
+        "new"
+    }
+
+    fn can_import(&self, _path: &Path) -> bool {
+        false // Never imports from existing files
+    }
+
+    fn import(
+        &self,
+        _source: &Path,
+        conn: &mut Connection,
+        _progress: Option<&dyn ImportProgress>,
+    ) -> Result<ImportStats, Error> {
+        // Just ensure schema is initialized
+        crate::db::migrations::run_migrations(conn)?;
+        Ok(ImportStats::default())
+    }
+}
+
+/// Factory to create import backend (only NewInstance for now)
+pub fn create_backend(_format: Option<&str>) -> Box<dyn ImportBackend> {
+    // Future: match on format to return ZshHistdb, BashHistory, Atuin, etc.
+    Box::new(NewInstance)
+}
+```
+
+Future import backends (deferred):
+- `ZshHistdbImport` — Import from existing zsh-histdb SQLite
+- `BashHistoryImport` — Import from `~/.bash_history`
+- `ZshHistoryImport` — Import from `~/.zsh_history`
+- `AtuinImport` — Import from atuin SQLite
+
+---
+
+### 7. Extensible Search Backend (`histdb-core/src/search/`)
 
 The search system uses a trait-based design for extensibility:
 
@@ -1588,6 +1674,141 @@ $env.config.hooks.env_change = {
 | Native socket | ✅ (zsh/net/socket) | ❌ (socat) | ❌ (socat) |
 | Interactive search | ✅ (widget) | ✅ (fzf) | ✅ (menu) |
 | Async send | ✅ (&!) | ✅ (&) | ⚠️ |
+
+#### Shell Offline Queue
+
+When the daemon is unavailable, shells queue commands locally for later replay.
+This provides **near 100% reliability** - no commands are lost.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Shell Offline Queue                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Shell executes command                                                 │
+│          │                                                               │
+│          ▼                                                               │
+│   ┌──────────────┐     success    ┌─────────────────┐                   │
+│   │ Try daemon   │ ─────────────► │ Command recorded │                   │
+│   │ socket       │                │ (normal path)    │                   │
+│   └──────────────┘                └─────────────────┘                   │
+│          │ fail                                                          │
+│          ▼                                                               │
+│   ┌──────────────────────────────────────┐                              │
+│   │ Queue to local SQLite                │                              │
+│   │ ~/.local/share/histdb/offline.db     │                              │
+│   └──────────────────────────────────────┘                              │
+│          │                                                               │
+│          ▼ (on next successful daemon connect)                          │
+│   ┌──────────────────────────────────────┐                              │
+│   │ Replay queued commands to daemon     │                              │
+│   │ (in order, with original timestamps) │                              │
+│   └──────────────────────────────────────┘                              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Offline database schema:**
+
+```sql
+-- ~/.local/share/histdb/offline.db
+CREATE TABLE IF NOT EXISTS offline_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    queued_at INTEGER NOT NULL,          -- When queued (for ordering)
+    request_type TEXT NOT NULL,          -- 'start' or 'finish'
+    request_json TEXT NOT NULL,          -- Full request payload
+    original_timestamp INTEGER NOT NULL  -- Original command timestamp
+);
+
+CREATE INDEX IF NOT EXISTS offline_queue_order ON offline_queue(queued_at);
+```
+
+**Shell implementation (ZSH example):**
+
+```zsh
+# histdb.zsh - with offline queue support
+typeset -g HISTDB_OFFLINE_DB="${XDG_DATA_HOME:-$HOME/.local/share}/histdb/offline.db"
+
+_histdb_ensure_offline_db() {
+    [[ -f $HISTDB_OFFLINE_DB ]] && return
+    mkdir -p "${HISTDB_OFFLINE_DB:h}"
+    sqlite3 "$HISTDB_OFFLINE_DB" "
+        CREATE TABLE IF NOT EXISTS offline_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queued_at INTEGER NOT NULL,
+            request_type TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            original_timestamp INTEGER NOT NULL
+        );
+    "
+}
+
+_histdb_queue_offline() {
+    local request_type="$1" json="$2" timestamp="$3"
+    _histdb_ensure_offline_db
+    sqlite3 "$HISTDB_OFFLINE_DB" "
+        INSERT INTO offline_queue (queued_at, request_type, request_json, original_timestamp)
+        VALUES ($(date +%s), '$request_type', '${json//\'/\'\'}', $timestamp);
+    "
+}
+
+_histdb_replay_offline() {
+    [[ -f $HISTDB_OFFLINE_DB ]] || return
+    local count=$(sqlite3 "$HISTDB_OFFLINE_DB" "SELECT COUNT(*) FROM offline_queue")
+    [[ $count -eq 0 ]] && return
+
+    # Replay in order
+    sqlite3 -json "$HISTDB_OFFLINE_DB" "SELECT * FROM offline_queue ORDER BY queued_at" | \
+    jq -c '.[]' | while read -r row; do
+        local id=$(echo "$row" | jq -r '.id')
+        local json=$(echo "$row" | jq -r '.request_json')
+
+        if _histdb_send "$json" >/dev/null 2>&1; then
+            sqlite3 "$HISTDB_OFFLINE_DB" "DELETE FROM offline_queue WHERE id = $id"
+        else
+            break  # Daemon still unavailable
+        fi
+    done
+}
+
+_histdb_send_or_queue() {
+    local json="$1" request_type="$2" timestamp="${3:-$(date +%s)}"
+
+    # Try daemon first
+    local resp=$(_histdb_send "$json" 2>/dev/null)
+    if [[ -n "$resp" ]]; then
+        # Success - also try to replay any queued commands
+        _histdb_replay_offline &!
+        print -- "$resp"
+        return 0
+    fi
+
+    # Queue for later
+    _histdb_queue_offline "$request_type" "$json" "$timestamp"
+    return 1
+}
+
+# Updated hook to use offline queue
+_histdb_addhistory() {
+    _histdb_init
+    local cmd="${1[1,-2]}"
+    [[ -z "$cmd" ]] && return 0
+
+    local timestamp=$(date +%s)
+    local json='{"type":"StartCommand","argv":"'${cmd//\"/\\\"}'",'
+    json+='"dir":"'${PWD//\"/\\\"}'","session_id":'$HISTDB_SESSION',"timestamp":'$timestamp'}'
+
+    local resp=$(_histdb_send_or_queue "$json" "start" "$timestamp")
+    HISTDB_LAST_ID=$(print -- "$resp" | jq -r '.id // empty')
+    return 0
+}
+```
+
+**Replay behavior:**
+- Commands replayed in original order (by `queued_at`)
+- Original timestamps preserved (for correct history ordering)
+- Partial replay safe (stops on first failure, resumes later)
+- Background replay doesn't block shell
 
 ---
 
@@ -2699,13 +2920,18 @@ criterion = "0.5"             # Benchmarking
    - Fallback: Shell starts daemon if socket missing (Alpine, BSDs)
    - Graceful shutdown drains queue, flushes SQLite, syncs peers
    - Crash recovery: ≤10ms data loss, auto-restart, index rebuild from SQLite
+- ✅ **Import tool**: Interface-only with fresh instance implementation
+   - `ImportBackend` trait for future extensibility
+   - Default `NewInstance` implementation creates empty database
+   - No import formats in initial release (deferred)
+- ✅ **Shell offline queue**: Local SQLite buffer when daemon unavailable
+   - Shell queues commands to `~/.local/share/histdb/offline.db`
+   - Replay to daemon on reconnect
+   - Near 100% reliability (no lost commands)
 
 ### Still Open
 
-1. **Import tool priority**: Which formats to support first?
-   - zsh-histdb SQLite (migration)
-   - .zsh_history / .bash_history (plain text)
-   - atuin SQLite
+(No critical questions remaining - ready for implementation review)
 
 ---
 
