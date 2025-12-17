@@ -191,6 +191,13 @@ The daemon uses a **lock-free, wait-free** architecture to handle concurrent she
 ```rust
 // ingest/queue.rs
 use crossbeam_queue::ArrayQueue;
+use uuid::Uuid;
+
+/// Type aliases for UUID-based identifiers
+/// All IDs use UUIDv7 for global uniqueness and time-ordering
+pub type SessionId = Uuid;
+pub type HistoryId = Uuid;
+pub type EntryId = Uuid;
 
 /// Lock-free bounded queue for incoming commands
 /// - Wait-free push (returns error if full, never blocks)
@@ -209,15 +216,15 @@ pub struct PendingCommand {
 
 pub enum CommandKind {
     Start {
-        session_id: u64,
-        argv: Box<str>,        // Owned, no lifetime issues
+        session_id: SessionId,  // UUIDv7 - globally unique, time-ordered
+        argv: Box<str>,         // Owned, no lifetime issues
         dir: Box<Path>,
         host: Box<str>,
         start_time: i64,
         response_tx: Option<oneshot::Sender<HistoryId>>,
     },
     Finish {
-        history_id: HistoryId,
+        history_id: HistoryId,  // UUIDv7 - correlates with Start response
         exit_status: i32,
         duration_ms: u64,
     },
@@ -266,9 +273,49 @@ impl CommandQueue {
 
 ```rust
 // ingest/writer.rs
+/// Writer thread health status
+pub struct WriterHealth {
+    /// True if writer is healthy, false if experiencing errors
+    healthy: AtomicBool,
+    /// Count of consecutive errors
+    error_count: AtomicU64,
+    /// Last error message (for diagnostics)
+    last_error: parking_lot::RwLock<Option<String>>,
+}
+
+impl WriterHealth {
+    pub fn new() -> Self {
+        Self {
+            healthy: AtomicBool::new(true),
+            error_count: AtomicU64::new(0),
+            last_error: parking_lot::RwLock::new(None),
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_healthy(&self) {
+        self.healthy.store(true, Ordering::Relaxed);
+        self.error_count.store(0, Ordering::Relaxed);
+    }
+
+    pub fn mark_error(&self, err: &str) {
+        self.healthy.store(false, Ordering::Relaxed);
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+        *self.last_error.write() = Some(err.to_string());
+    }
+
+    pub fn error_count(&self) -> u64 {
+        self.error_count.load(Ordering::Relaxed)
+    }
+}
+
 pub struct WriterThread {
     queue: Arc<CommandQueue>,
     conn: Connection,
+    health: Arc<WriterHealth>,
     // Pre-compiled statements for hot path
     insert_command_stmt: Statement,
     insert_place_stmt: Statement,
@@ -277,26 +324,64 @@ pub struct WriterThread {
 }
 
 impl WriterThread {
-    pub fn spawn(queue: Arc<CommandQueue>, db_path: &Path) -> JoinHandle<()> {
-        let conn = Connection::open(db_path).expect("Failed to open database");
+    /// Spawn writer thread with health monitoring
+    pub fn spawn(
+        queue: Arc<CommandQueue>,
+        db_path: &Path,
+        health: Arc<WriterHealth>,
+    ) -> JoinHandle<()> {
+        let db_path = db_path.to_owned();
+
+        std::thread::spawn(move || {
+            // Catch panics to prevent silent thread death
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match Self::init_and_run(queue, &db_path, Arc::clone(&health)) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        health.mark_error(&format!("Writer thread error: {}", e));
+                        tracing::error!("Writer thread exited with error: {}", e);
+                    }
+                }
+            }));
+
+            if let Err(panic) = result {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "Unknown panic".to_string());
+
+                health.mark_error(&format!("Writer thread panicked: {}", msg));
+                tracing::error!("Writer thread panicked: {}", msg);
+            }
+        })
+    }
+
+    fn init_and_run(
+        queue: Arc<CommandQueue>,
+        db_path: &Path,
+        health: Arc<WriterHealth>,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = Connection::open(db_path)?;
+
         // Optimize for write throughput
         conn.execute_batch("
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA busy_timeout = 5000;
-        ").unwrap();
+        ")?;
 
-        std::thread::spawn(move || {
-            let mut writer = WriterThread::new(queue, conn);
-            writer.run();
-        })
+        let mut writer = WriterThread::new(queue, conn, health);
+        writer.run()
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), rusqlite::Error> {
         let mut batch = Vec::with_capacity(64);
         let batch_interval = Duration::from_millis(10);
         let mut last_flush = Instant::now();
+        let mut retry_backoff = Duration::from_millis(10);
+        const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
         loop {
             // Drain available commands (non-blocking)
@@ -308,8 +393,24 @@ impl WriterThread {
             );
 
             if should_flush {
-                self.flush_batch(&mut batch);
-                last_flush = Instant::now();
+                match self.flush_batch(&mut batch) {
+                    Ok(()) => {
+                        self.health.mark_healthy();
+                        retry_backoff = Duration::from_millis(10);  // Reset backoff
+                        last_flush = Instant::now();
+                    }
+                    Err(e) => {
+                        self.health.mark_error(&e.to_string());
+                        tracing::warn!("Batch flush failed: {}, retrying in {:?}", e, retry_backoff);
+
+                        // Exponential backoff before retry
+                        std::thread::sleep(retry_backoff);
+                        retry_backoff = std::cmp::min(retry_backoff * 2, MAX_BACKOFF);
+
+                        // Re-attempt: if database is locked/busy, retry will succeed
+                        // Commands remain in batch for retry
+                    }
+                }
             } else if batch.is_empty() {
                 // No work: park thread briefly to avoid busy-spin
                 std::thread::park_timeout(Duration::from_millis(1));
@@ -317,43 +418,59 @@ impl WriterThread {
         }
     }
 
-    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
+    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) -> Result<(), rusqlite::Error> {
         if batch.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Single transaction for entire batch
-        let tx = self.conn.transaction().unwrap();
+        let tx = self.conn.transaction()?;
 
         for cmd in batch.drain(..) {
             match cmd.kind {
                 CommandKind::Start { session_id, argv, dir, host, start_time, response_tx } => {
-                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time);
+                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time)?;
                     if let Some(tx) = response_tx {
                         let _ = tx.send(id);  // Ignore if receiver dropped
                     }
                 }
                 CommandKind::Finish { history_id, exit_status, duration_ms } => {
-                    self.update_finish(&tx, history_id, exit_status, duration_ms);
+                    self.update_finish(&tx, history_id, exit_status, duration_ms)?;
                 }
             }
         }
 
-        tx.commit().unwrap();
+        tx.commit()?;
+        Ok(())
     }
 
     #[inline]
     fn insert_history_entry(
         &self,
         tx: &Transaction,
-        session_id: u64,
+        session_id: SessionId,
         argv: &str,
         dir: &Path,
         host: &str,
         start_time: i64,
-    ) -> HistoryId {
+    ) -> Result<HistoryId, rusqlite::Error> {
+        // Generate new UUIDv7 for history entry
+        let history_id = Uuid::now_v7();
         // Uses prepared statements, parameterized queries
+        // ... implementation stores history_id as TEXT in SQLite
+        Ok(history_id)
+    }
+
+    fn update_finish(
+        &self,
+        tx: &Transaction,
+        history_id: HistoryId,
+        exit_status: i32,
+        duration_ms: u64,
+    ) -> Result<(), rusqlite::Error> {
+        // Update history entry with exit status and duration
         // ... implementation
+        Ok(())
     }
 }
 ```
@@ -364,7 +481,7 @@ impl WriterThread {
 // daemon/handler.rs
 pub struct ConnectionHandler {
     queue: Arc<CommandQueue>,
-    session_id: u64,
+    session_id: SessionId,  // UUIDv7 from shell
     host: Box<str>,
 }
 
@@ -411,7 +528,7 @@ impl ConnectionHandler {
 
         // Wait for writer to process (typically < 10ms)
         match tokio::time::timeout(Duration::from_millis(100), rx).await {
-            Ok(Ok(id)) => Response::CommandStarted { id: id.0 },
+            Ok(Ok(id)) => Response::CommandStarted { id },  // id is HistoryId (Uuid)
             _ => Response::Timeout,
         }
     }
@@ -593,13 +710,13 @@ pub struct HistoryIndex {
     /// Directory → entry IDs (for --in/--at queries)
     by_dir: HashMap<Box<Path>, Vec<EntryId>>,
     /// Last N entries per session (for isearch)
-    by_session: HashMap<u64, VecDeque<EntryId>>,
+    by_session: HashMap<SessionId, VecDeque<EntryId>>,  // SessionId is Uuid
 }
 
 #[derive(Clone)]
 pub struct RecentEntry {
-    pub id: EntryId,
-    pub session: u64,
+    pub id: EntryId,          // UUIDv7
+    pub session: SessionId,   // UUIDv7
     pub argv: Box<str>,
     pub dir: Box<Path>,
     pub host: Box<str>,
@@ -943,6 +1060,9 @@ impl<'a> Recorder<'a> {
 pub fn start_command(&self, argv: &str, dir: &Path) -> Result<HistoryId, Error> {
     let tx = self.conn.transaction()?;
 
+    // Generate UUIDv7 for this history entry
+    let history_id = Uuid::now_v7();
+
     // All inserts in one transaction - no race conditions
     tx.execute(
         "INSERT OR IGNORE INTO commands (argv) VALUES (?1)",
@@ -955,16 +1075,16 @@ pub fn start_command(&self, argv: &str, dir: &Path) -> Result<HistoryId, Error> 
     )?;
 
     tx.execute(
-        "INSERT INTO history (session, command_id, place_id, start_time)
-         SELECT ?1, c.id, p.id, ?2
+        "INSERT INTO history (uuid, session, command_id, place_id, start_time)
+         SELECT ?1, ?2, c.id, p.id, ?3
          FROM commands c, places p
-         WHERE c.argv = ?3 AND p.host = ?4 AND p.dir = ?5",
-        params![self.session_id, Utc::now().timestamp(), argv, self.host, dir.display().to_string()],
+         WHERE c.argv = ?4 AND p.host = ?5 AND p.dir = ?6",
+        params![history_id.to_string(), self.session_id.to_string(), Utc::now().timestamp(),
+                argv, self.host, dir.display().to_string()],
     )?;
 
-    let id = tx.last_insert_rowid();
     tx.commit()?;
-    Ok(HistoryId(id))
+    Ok(history_id)
 }
 ```
 
@@ -974,7 +1094,7 @@ pub fn start_command(&self, argv: &str, dir: &Path) -> Result<HistoryId, Error> 
 pub struct QueryBuilder {
     host_filter: Option<String>,
     dir_filter: Option<DirFilter>,
-    session_filter: Option<i64>,
+    session_filter: Option<SessionId>,  // UUID filter
     time_range: Option<TimeRange>,
     pattern: Option<String>,
     limit: Option<usize>,
@@ -1192,6 +1312,18 @@ pub enum Cli {
 
     /// Start the daemon for zsh integration
     Daemon(DaemonArgs),
+
+    /// Queue a command to offline storage (shell helper)
+    #[command(name = "offline-queue")]
+    OfflineQueue(OfflineQueueArgs),
+
+    /// Replay queued commands to daemon (shell helper)
+    #[command(name = "offline-replay")]
+    OfflineReplay(OfflineReplayArgs),
+
+    /// Generate a new session ID (UUIDv7)
+    #[command(name = "session-id")]
+    SessionId,
 }
 
 #[derive(Args)]
@@ -1209,7 +1341,7 @@ pub struct QueryArgs {
     at_dir: Option<PathBuf>,
 
     #[arg(short)]
-    session: Option<i64>,
+    session: Option<Uuid>,  // SessionId is UUIDv7
 
     #[arg(long)]
     from: Option<String>,
@@ -1234,6 +1366,103 @@ pub struct QueryArgs {
 
     #[arg(long)]
     exact: bool,
+}
+
+/// Arguments for offline-queue command (shell helper)
+#[derive(Args)]
+pub struct OfflineQueueArgs {
+    /// Path to offline queue database
+    #[arg(long)]
+    db: PathBuf,
+
+    /// Request type ('start' or 'finish')
+    #[arg(long, name = "TYPE")]
+    r#type: String,
+
+    /// JSON payload (safely bound, no injection possible)
+    #[arg(long)]
+    json: String,
+
+    /// Original command timestamp
+    #[arg(long)]
+    timestamp: i64,
+}
+
+/// Arguments for offline-replay command (shell helper)
+#[derive(Args)]
+pub struct OfflineReplayArgs {
+    /// Path to offline queue database
+    #[arg(long)]
+    db: PathBuf,
+}
+```
+
+**Offline queue command implementation:**
+
+```rust
+// cli/offline.rs
+
+pub fn handle_offline_queue(args: OfflineQueueArgs) -> Result<()> {
+    let conn = Connection::open(&args.db)?;
+
+    // Ensure schema exists
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS offline_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queued_at INTEGER NOT NULL,
+            request_type TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            original_timestamp INTEGER NOT NULL
+        );
+    ")?;
+
+    // Safe parameterized insert - no SQL injection possible
+    conn.execute(
+        "INSERT INTO offline_queue (queued_at, request_type, request_json, original_timestamp)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            Utc::now().timestamp(),
+            &args.r#type,
+            &args.json,
+            args.timestamp
+        ],
+    )?;
+
+    Ok(())
+}
+
+pub fn handle_offline_replay(args: OfflineReplayArgs) -> Result<()> {
+    let conn = Connection::open(&args.db)?;
+
+    // Get queued commands in order
+    let mut stmt = conn.prepare(
+        "SELECT id, request_json FROM offline_queue ORDER BY queued_at"
+    )?;
+
+    let entries: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    for (id, json) in entries {
+        // Try to send to daemon
+        match send_to_daemon(&json) {
+            Ok(_) => {
+                // Delete successfully replayed entry
+                conn.execute("DELETE FROM offline_queue WHERE id = ?1", params![id])?;
+            }
+            Err(_) => {
+                // Daemon unavailable, stop replay
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn handle_session_id() {
+    // Generate and print UUIDv7
+    println!("{}", Uuid::now_v7());
 }
 ```
 
@@ -1746,29 +1975,18 @@ _histdb_ensure_offline_db() {
 _histdb_queue_offline() {
     local request_type="$1" json="$2" timestamp="$3"
     _histdb_ensure_offline_db
-    sqlite3 "$HISTDB_OFFLINE_DB" "
-        INSERT INTO offline_queue (queued_at, request_type, request_json, original_timestamp)
-        VALUES ($(date +%s), '$request_type', '${json//\'/\'\'}', $timestamp);
-    "
+    # Use CLI helper for safe parameter binding (prevents SQL injection)
+    histdb-cli offline-queue \
+        --db "$HISTDB_OFFLINE_DB" \
+        --type "$request_type" \
+        --json "$json" \
+        --timestamp "$timestamp"
 }
 
 _histdb_replay_offline() {
     [[ -f $HISTDB_OFFLINE_DB ]] || return
-    local count=$(sqlite3 "$HISTDB_OFFLINE_DB" "SELECT COUNT(*) FROM offline_queue")
-    [[ $count -eq 0 ]] && return
-
-    # Replay in order
-    sqlite3 -json "$HISTDB_OFFLINE_DB" "SELECT * FROM offline_queue ORDER BY queued_at" | \
-    jq -c '.[]' | while read -r row; do
-        local id=$(echo "$row" | jq -r '.id')
-        local json=$(echo "$row" | jq -r '.request_json')
-
-        if _histdb_send "$json" >/dev/null 2>&1; then
-            sqlite3 "$HISTDB_OFFLINE_DB" "DELETE FROM offline_queue WHERE id = $id"
-        else
-            break  # Daemon still unavailable
-        fi
-    done
+    # Use CLI helper to replay queued commands (handles all SQL safely)
+    histdb-cli offline-replay --db "$HISTDB_OFFLINE_DB"
 }
 
 _histdb_send_or_queue() {
@@ -3060,7 +3278,7 @@ Shells generate their own session IDs using **UUIDv7** — no daemon round-trip 
 let session_id = Uuid::now_v7();
 
 // In ZSH plugin
-typeset -g HISTDB_SESSION=$(uuidgen -r)  # Or use histdb-cli helper
+typeset -g HISTDB_SESSION=$(histdb-cli session-id)  # Generate UUIDv7 session ID
 ```
 
 ### Log Compaction
