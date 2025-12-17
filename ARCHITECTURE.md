@@ -269,9 +269,152 @@ impl CommandQueue {
 }
 ```
 
-#### 2. Writer Thread (Single Consumer)
+#### 2. Writer Thread with Supervisor Pattern
 
 ```rust
+// ingest/supervisor.rs
+
+/// Supervisor that manages and restarts the writer thread on failure
+pub struct WriterSupervisor {
+    queue: Arc<CommandQueue>,
+    db_path: PathBuf,
+    health: Arc<WriterHealth>,
+    config: SupervisorConfig,
+    /// Channel to signal supervisor shutdown
+    shutdown_tx: broadcast::Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SupervisorConfig {
+    /// Maximum restart attempts before giving up
+    pub max_restarts: u32,
+    /// Time window for counting restarts
+    pub restart_window: Duration,
+    /// Delay before restarting after failure
+    pub restart_delay: Duration,
+    /// Backoff multiplier for repeated failures
+    pub backoff_multiplier: f64,
+    /// Maximum restart delay
+    pub max_restart_delay: Duration,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            max_restarts: 5,
+            restart_window: Duration::from_secs(60),
+            restart_delay: Duration::from_millis(100),
+            backoff_multiplier: 2.0,
+            max_restart_delay: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Tracks restart history for rate limiting
+struct RestartHistory {
+    timestamps: VecDeque<Instant>,
+    current_delay: Duration,
+}
+
+impl WriterSupervisor {
+    pub fn new(
+        queue: Arc<CommandQueue>,
+        db_path: PathBuf,
+        health: Arc<WriterHealth>,
+        config: SupervisorConfig,
+    ) -> (Self, broadcast::Receiver<()>) {
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let supervisor = Self {
+            queue,
+            db_path,
+            health,
+            config,
+            shutdown_tx,
+        };
+        (supervisor, shutdown_rx)
+    }
+
+    /// Start the supervisor (runs until shutdown signal)
+    pub async fn run(self) {
+        let mut history = RestartHistory {
+            timestamps: VecDeque::new(),
+            current_delay: self.config.restart_delay,
+        };
+
+        loop {
+            // Spawn writer thread
+            let handle = WriterThread::spawn(
+                Arc::clone(&self.queue),
+                &self.db_path,
+                Arc::clone(&self.health),
+            );
+
+            tracing::info!("Writer thread started");
+
+            // Wait for thread to exit (it shouldn't under normal operation)
+            let exit_reason = tokio::task::spawn_blocking(move || handle.join()).await;
+
+            // Check if we should shutdown
+            if self.shutdown_tx.receiver_count() == 0 {
+                tracing::info!("Supervisor shutting down");
+                break;
+            }
+
+            // Thread exited unexpectedly - handle restart
+            match exit_reason {
+                Ok(Ok(())) => {
+                    tracing::warn!("Writer thread exited normally (unexpected)");
+                }
+                Ok(Err(_)) => {
+                    tracing::error!("Writer thread panicked");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to join writer thread: {}", e);
+                }
+            }
+
+            // Rate limit restarts
+            let now = Instant::now();
+            history.timestamps.push_back(now);
+
+            // Remove old timestamps outside the window
+            while let Some(&ts) = history.timestamps.front() {
+                if now.duration_since(ts) > self.config.restart_window {
+                    history.timestamps.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Check if too many restarts
+            if history.timestamps.len() as u32 >= self.config.max_restarts {
+                tracing::error!(
+                    "Writer thread restarted {} times in {:?}, giving up",
+                    self.config.max_restarts,
+                    self.config.restart_window
+                );
+                self.health.mark_error("Max restarts exceeded - supervisor stopped");
+                break;
+            }
+
+            // Apply backoff delay
+            tracing::info!("Restarting writer thread in {:?}", history.current_delay);
+            tokio::time::sleep(history.current_delay).await;
+
+            // Increase delay for next failure (exponential backoff)
+            history.current_delay = Duration::from_secs_f64(
+                (history.current_delay.as_secs_f64() * self.config.backoff_multiplier)
+                    .min(self.config.max_restart_delay.as_secs_f64())
+            );
+        }
+    }
+
+    /// Request supervisor shutdown
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(());
+    }
+}
+
 // ingest/writer.rs
 /// Writer thread health status
 pub struct WriterHealth {
@@ -281,6 +424,8 @@ pub struct WriterHealth {
     error_count: AtomicU64,
     /// Last error message (for diagnostics)
     last_error: parking_lot::RwLock<Option<String>>,
+    /// Count of restarts (set by supervisor)
+    restart_count: AtomicU32,
 }
 
 impl WriterHealth {
@@ -289,6 +434,7 @@ impl WriterHealth {
             healthy: AtomicBool::new(true),
             error_count: AtomicU64::new(0),
             last_error: parking_lot::RwLock::new(None),
+            restart_count: AtomicU32::new(0),
         }
     }
 
@@ -309,6 +455,14 @@ impl WriterHealth {
 
     pub fn error_count(&self) -> u64 {
         self.error_count.load(Ordering::Relaxed)
+    }
+
+    pub fn restart_count(&self) -> u32 {
+        self.restart_count.load(Ordering::Relaxed)
+    }
+
+    pub fn increment_restart(&self) {
+        self.restart_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -608,26 +762,356 @@ impl ConnectionHandler {
 
 This keeps total worst-case latency under 1ms while giving the writer thread time to drain.
 
-### Query Consistency
+### Async Backpressure Handling (Shell Never Waits)
 
-Queries read directly from SQLite, which may be slightly behind the queue:
+The shell should **never block** waiting for the daemon. Instead of synchronous retries,
+the daemon "watches" the shell asynchronously:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Async Backpressure Flow                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Shell                    Daemon                       Writer Thread         │
+│    │                        │                              │                 │
+│    │  send_async(cmd)       │                              │                 │
+│    │───────────────────────►│                              │                 │
+│    │                        │  try_push (non-blocking)     │                 │
+│    │  ack (immediate)       │◄─────────────────────────────│                 │
+│    │◄───────────────────────│                              │                 │
+│    │                        │                              │                 │
+│    │  (shell continues)     │  if QueueFull:               │                 │
+│    │                        │    spawn async retry task    │                 │
+│    │                        │    │                         │                 │
+│    │                        │    │  wait_for_space()       │                 │
+│    │                        │    │────────────────────────►│                 │
+│    │                        │    │                         │  drain()        │
+│    │                        │    │  space_available        │                 │
+│    │                        │    │◄────────────────────────│                 │
+│    │                        │    │                         │                 │
+│    │                        │    │  retry_push(cmd)        │                 │
+│    │                        │    │────────────────────────►│                 │
+│    │                        │                              │                 │
+│    ▼                        ▼                              ▼                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation:**
 
 ```rust
-// query.rs
-impl QueryExecutor {
-    pub fn query(&self, builder: QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
-        // Option 1: Read from SQLite only (simple, eventually consistent)
-        self.conn.query(&builder.build_sql())
+// daemon/handler.rs
+use tokio::sync::mpsc;
 
-        // Option 2: Merge with pending queue (complex, strongly consistent)
-        // let db_results = self.conn.query(&builder.build_sql())?;
-        // let pending = self.queue.peek_matching(&builder);
-        // merge_results(db_results, pending)
+/// Overflow queue for commands when main queue is full
+struct OverflowHandler {
+    /// Channel for commands that couldn't be queued immediately
+    overflow_tx: mpsc::Sender<PendingCommand>,
+    /// Task handle for async retry processor
+    retry_task: JoinHandle<()>,
+}
+
+impl OverflowHandler {
+    /// Spawn async overflow handler
+    pub fn new(queue: Arc<CommandQueue>, capacity: usize) -> Self {
+        let (overflow_tx, overflow_rx) = mpsc::channel(capacity);
+
+        let retry_task = tokio::spawn(Self::retry_loop(queue, overflow_rx));
+
+        Self { overflow_tx, retry_task }
+    }
+
+    /// Async retry loop - watches for space in main queue
+    async fn retry_loop(
+        queue: Arc<CommandQueue>,
+        mut overflow_rx: mpsc::Receiver<PendingCommand>,
+    ) {
+        while let Some(cmd) = overflow_rx.recv().await {
+            // Wait for queue space with exponential backoff
+            let mut delay = Duration::from_micros(100);
+            let max_delay = Duration::from_millis(100);
+
+            loop {
+                match queue.try_push(cmd.clone()) {
+                    Ok(()) => {
+                        tracing::debug!("Overflow command successfully queued");
+                        break;
+                    }
+                    Err(_) => {
+                        // Queue still full - async wait
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(max_delay);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ConnectionHandler {
+    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+        let cmd = PendingCommand { /* ... */ };
+
+        // Non-blocking push attempt
+        match self.queue.try_push(cmd.clone()) {
+            Ok(()) => Response::Accepted,
+            Err(_) => {
+                // Queue full - hand off to async overflow handler
+                // Shell gets immediate response, daemon retries async
+                match self.overflow.overflow_tx.try_send(cmd) {
+                    Ok(()) => {
+                        metrics::counter!("histdb.queue.overflow").increment(1);
+                        Response::AcceptedOverflow  // Tell shell "we got it, processing async"
+                    }
+                    Err(_) => {
+                        // Even overflow is full - extreme backpressure
+                        metrics::counter!("histdb.queue.overflow_full").increment(1);
+                        Response::QueueFull
+                    }
+                }
+            }
+        }
     }
 }
 ```
 
-**Recommendation**: Use eventual consistency (Option 1). The 10ms delay is imperceptible for interactive use, and strong consistency adds complexity.
+**Shell side - non-blocking send:**
+
+```zsh
+# zsh integration - async send
+_histdb_send_async() {
+    local json="$1" request_type="$2"
+    local hlc_json=$(_histdb_get_hlc)
+
+    # Background send - shell never waits
+    {
+        local resp
+        resp=$(_histdb_send "$json" 2>/dev/null)
+
+        case "$resp" in
+            *"Accepted"*|*"AcceptedOverflow"*)
+                # Success - daemon is handling it
+                ;;
+            *"QueueFull"*|"")
+                # Daemon overloaded or unreachable - queue locally
+                _histdb_queue_offline "$request_type" "$json" "$hlc_json"
+                ;;
+        esac
+    } &!  # Disown: shell doesn't wait, no zombie processes
+}
+
+# Updated hooks use async send
+_histdb_addhistory() {
+    _histdb_init
+    local cmd="${1[1,-2]}"
+    [[ -z "$cmd" ]] && return 0
+
+    HISTDB_LAST_HISTORY_ID=$(_histdb_generate_uuid)
+    local json='{"type":"StartCommand","history_id":"'$HISTDB_LAST_HISTORY_ID'",...}'
+
+    # Async send - returns immediately
+    _histdb_send_async "$json" "start"
+    return 0
+}
+```
+
+**Response types:**
+
+| Response | Meaning | Shell Action |
+|----------|---------|--------------|
+| `Accepted` | Queued in main queue | Done |
+| `AcceptedOverflow` | Queued in overflow, daemon retrying | Done |
+| `QueueFull` | Both queues full (extreme load) | Queue offline |
+| (timeout) | Daemon unreachable | Queue offline |
+
+**Benefits:**
+- Shell hooks complete in <1μs (just fork a background process)
+- Daemon handles backpressure asynchronously with retries
+- Extreme backpressure falls back to offline queue
+- No shell latency even under high load
+
+### Query Consistency Model: Bounded Staleness
+
+histdb uses a **bounded staleness** consistency model:
+
+> **Guarantee**: Queries may not see commands written within the last `STALENESS_BOUND_MS`
+> (default: 10ms). After this window, all written commands are guaranteed to be visible.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Bounded Staleness Timeline                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  t=0ms        t=5ms          t=10ms         t=15ms                          │
+│    │            │              │              │                              │
+│    ▼            ▼              ▼              ▼                              │
+│  ┌────┐      ┌────┐        ┌────┐         ┌────┐                            │
+│  │CMD │      │    │        │CMD │         │CMD │                            │
+│  │SENT│      │    │        │IN  │         │VISIBLE│                         │
+│  └────┘      └────┘        │DB  │         │TO     │                         │
+│                            └────┘         │QUERY  │                         │
+│                                           └────┘                            │
+│  ◄────── Staleness Window ──────►                                           │
+│          (configurable)                                                      │
+│                                                                              │
+│  During this window:          After this window:                            │
+│  - Command MAY not be visible - Command GUARANTEED visible                  │
+│  - Depends on batch timing    - Strong consistency                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration**:
+```toml
+[daemon]
+# Bounded staleness window (milliseconds)
+# Queries may not see commands newer than this
+staleness_bound_ms = 10
+```
+
+**Implementation**:
+```rust
+// query.rs
+
+/// Configuration for query consistency
+pub struct ConsistencyConfig {
+    /// Maximum staleness for queries (default: 10ms)
+    pub staleness_bound: Duration,
+}
+
+impl Default for ConsistencyConfig {
+    fn default() -> Self {
+        Self {
+            staleness_bound: Duration::from_millis(10),
+        }
+    }
+}
+
+impl QueryExecutor {
+    pub fn query(&self, builder: QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        // Read from SQLite - bounded staleness guarantees visibility after staleness_bound
+        self.conn.query(&builder.build_sql())
+    }
+
+    /// Query with explicit freshness requirement
+    /// Blocks until staleness bound has elapsed since last write
+    pub fn query_fresh(&self, builder: QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        // Wait for any pending writes to complete
+        self.wait_for_staleness_bound()?;
+        self.conn.query(&builder.build_sql())
+    }
+
+    fn wait_for_staleness_bound(&self) -> Result<(), Error> {
+        let last_write = self.last_write_time.load(Ordering::Acquire);
+        let elapsed = Instant::now().duration_since(Instant::from_nanos(last_write));
+
+        if elapsed < self.config.staleness_bound {
+            std::thread::sleep(self.config.staleness_bound - elapsed);
+        }
+        Ok(())
+    }
+}
+```
+
+**Why Bounded Staleness?**
+- **Predictable**: Users know exactly how stale results can be
+- **Testable**: Can write tests that verify the bound
+- **Simple**: No complex merge logic between queue and database
+- **Fast**: No blocking on writes for normal queries
+
+**Test Cases for Bounded Staleness**:
+```rust
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Test that commands become visible within staleness bound
+    #[test]
+    fn test_bounded_staleness_visibility() {
+        let daemon = TestDaemon::new();
+        let staleness_bound = Duration::from_millis(10);
+
+        // Write a command
+        let cmd = "echo test";
+        daemon.record_command(cmd);
+
+        // Immediately query - may not be visible
+        let results_immediate = daemon.query_recent(10);
+
+        // Wait for staleness bound + buffer
+        std::thread::sleep(staleness_bound + Duration::from_millis(5));
+
+        // Query again - must be visible
+        let results_after = daemon.query_recent(10);
+        assert!(results_after.iter().any(|r| r.argv == cmd),
+            "Command must be visible after staleness bound");
+    }
+
+    /// Test that staleness bound is actually bounded
+    #[test]
+    fn test_staleness_bound_maximum() {
+        let daemon = TestDaemon::new();
+        let staleness_bound = Duration::from_millis(10);
+
+        // Record 100 commands rapidly
+        for i in 0..100 {
+            daemon.record_command(&format!("cmd_{}", i));
+        }
+
+        // Wait for staleness bound
+        std::thread::sleep(staleness_bound + Duration::from_millis(5));
+
+        // All commands must be visible
+        let results = daemon.query_recent(100);
+        assert_eq!(results.len(), 100, "All commands visible after staleness bound");
+    }
+
+    /// Measure actual staleness to verify bound
+    #[test]
+    fn test_measure_actual_staleness() {
+        let daemon = TestDaemon::new();
+        let mut max_staleness = Duration::ZERO;
+
+        for _ in 0..100 {
+            let cmd = format!("test_{}", uuid::Uuid::new_v4());
+            let write_time = Instant::now();
+            daemon.record_command(&cmd);
+
+            // Poll until visible
+            loop {
+                let results = daemon.query_recent(1);
+                if results.iter().any(|r| r.argv == cmd) {
+                    let staleness = write_time.elapsed();
+                    max_staleness = max_staleness.max(staleness);
+                    break;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+
+        println!("Max observed staleness: {:?}", max_staleness);
+        assert!(max_staleness < Duration::from_millis(15),
+            "Staleness should be bounded by ~10ms + jitter");
+    }
+
+    /// Test query_fresh blocks appropriately
+    #[test]
+    fn test_query_fresh_blocks() {
+        let daemon = TestDaemon::new();
+
+        let cmd = "fresh_test";
+        daemon.record_command(cmd);
+
+        let start = Instant::now();
+        let results = daemon.query_fresh(1);  // Should block
+        let elapsed = start.elapsed();
+
+        assert!(results.iter().any(|r| r.argv == cmd));
+        assert!(elapsed >= Duration::from_millis(8),
+            "query_fresh should wait for staleness bound");
+    }
+}
+```
 
 ### Thread Model Summary
 
@@ -718,10 +1202,12 @@ pub struct IndexBounds {
 impl Default for IndexBounds {
     fn default() -> Self {
         Self {
-            max_entries: 10_000,
+            // Default to 1000 entries - user-configurable via [index].max_entries
+            // Hybrid query falls back to SQLite for entries beyond this limit
+            max_entries: 1_000,
             max_memory_bytes: 50 * 1024 * 1024,  // 50MB
             max_age_secs: 7 * 24 * 60 * 60,      // 7 days
-            max_per_session: 1000,
+            max_per_session: 500,
         }
     }
 }
@@ -1043,48 +1529,215 @@ impl WriterThread {
 
 ```rust
 // ops/query.rs
+
+/// Hybrid query executor: in-memory index + SQLite fallback
+///
+/// The in-memory index holds the N most recent commands (configurable, default 1000).
+/// Queries first check the index (wait-free), then fall back to SQLite for older
+/// entries or when the index doesn't satisfy the query fully.
 pub struct QueryExecutor {
-    /// Wait-free reader for recent entries
+    /// Wait-free reader for recent entries (bounded to N entries)
     index: IndexReader,
-    /// SQLite connection for older entries
-    conn: Connection,
-    /// Search backend (FTS5 or GLOB)
+    /// SQLite connection pool for older entries
+    pool: ConnectionPool,
+    /// Search backend (FTS5 or GLOB fallback)
     search: Box<dyn SearchBackend>,
+    /// Index bounds configuration (for knowing coverage)
+    index_bounds: IndexBounds,
+}
+
+/// Result source tracking for debugging/metrics
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultSource {
+    /// All results from in-memory index (fastest)
+    IndexOnly,
+    /// Results from SQLite only (index empty or query forced DB)
+    DatabaseOnly,
+    /// Merged results from both sources
+    Hybrid,
+}
+
+/// Query result with metadata
+pub struct QueryResult {
+    pub rows: Vec<HistoryRow>,
+    pub source: ResultSource,
+    pub index_hits: usize,
+    pub db_hits: usize,
 }
 
 impl QueryExecutor {
-    pub fn query(&self, builder: &QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
-        // 1. Fast path: check in-memory index first (wait-free)
-        let recent = self.index.search_recent(
-            builder.pattern.as_deref().unwrap_or(""),
-            builder.limit.unwrap_or(100),
-        );
+    pub fn new(
+        index: IndexReader,
+        pool: ConnectionPool,
+        search: Box<dyn SearchBackend>,
+        index_bounds: IndexBounds,
+    ) -> Self {
+        Self { index, pool, search, index_bounds }
+    }
 
-        if recent.len() >= builder.limit.unwrap_or(100) {
-            // Index had enough results, skip SQLite
-            return Ok(recent.into_iter().map(Into::into).collect());
+    /// Primary query method - uses hybrid index+SQLite approach
+    pub fn query(&self, builder: &QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        self.query_with_metadata(builder).map(|r| r.rows)
+    }
+
+    /// Query with metadata about result sources (for debugging/metrics)
+    pub fn query_with_metadata(&self, builder: &QueryBuilder) -> Result<QueryResult, Error> {
+        let requested_limit = builder.limit.unwrap_or(100);
+
+        // 1. Fast path: check in-memory index first (wait-free, O(1) reader acquisition)
+        let recent = self.index.search(builder)?;
+        let index_hits = recent.len();
+
+        // 2. Determine if we need SQLite fallback
+        let needs_db_fallback = self.needs_database_fallback(builder, &recent);
+
+        if !needs_db_fallback && recent.len() >= requested_limit {
+            // Index fully satisfied the query - fastest path
+            return Ok(QueryResult {
+                rows: recent.into_iter().take(requested_limit).map(Into::into).collect(),
+                source: ResultSource::IndexOnly,
+                index_hits,
+                db_hits: 0,
+            });
         }
 
-        // 2. Slow path: query SQLite for older entries
-        let from_db = self.search.search(&self.conn, builder)?;
+        // 3. Query SQLite for older/additional entries
+        let conn = self.pool.get()?;
 
-        // 3. Merge and deduplicate
-        Ok(merge_results(recent, from_db, builder.limit))
+        // Adjust DB query to exclude IDs already found in index
+        let exclude_ids: HashSet<_> = recent.iter().map(|e| e.id).collect();
+        let db_builder = builder.clone()
+            .exclude_ids(exclude_ids)
+            .limit(requested_limit.saturating_sub(recent.len()));
+
+        let from_db = self.search.search(&conn, &db_builder)?;
+        let db_hits = from_db.len();
+
+        // 4. Merge results: index entries first (more recent), then DB entries
+        let merged = self.merge_results(recent, from_db, requested_limit);
+
+        let source = match (index_hits > 0, db_hits > 0) {
+            (true, true) => ResultSource::Hybrid,
+            (true, false) => ResultSource::IndexOnly,
+            (false, _) => ResultSource::DatabaseOnly,
+        };
+
+        Ok(QueryResult {
+            rows: merged,
+            source,
+            index_hits,
+            db_hits,
+        })
+    }
+
+    /// Determine if query requires database fallback
+    fn needs_database_fallback(&self, builder: &QueryBuilder, index_results: &[RecentEntry]) -> bool {
+        // Always need DB if:
+        // 1. Query requests more results than index can hold
+        if builder.limit.unwrap_or(100) > self.index_bounds.max_entries {
+            return true;
+        }
+
+        // 2. Query has time range that extends beyond index coverage
+        if let Some(ref time_range) = builder.time_range {
+            let oldest_in_index = self.index.oldest_timestamp();
+            if let Some(oldest) = oldest_in_index {
+                if time_range.start.map_or(true, |s| s < oldest) {
+                    return true;
+                }
+            }
+        }
+
+        // 3. Index results are fewer than requested and query has no constraints
+        //    that would limit results to recent entries only
+        let requested = builder.limit.unwrap_or(100);
+        if index_results.len() < requested && !builder.is_recent_only() {
+            return true;
+        }
+
+        false
+    }
+
+    /// Merge index and database results, preserving order and deduplicating
+    fn merge_results(
+        &self,
+        index_results: Vec<RecentEntry>,
+        db_results: Vec<HistoryRow>,
+        limit: usize,
+    ) -> Vec<HistoryRow> {
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut merged = Vec::with_capacity(limit);
+
+        // Add index results first (more recent)
+        for entry in index_results {
+            if seen.insert(entry.id) {
+                merged.push(entry.into());
+                if merged.len() >= limit {
+                    return merged;
+                }
+            }
+        }
+
+        // Add DB results (older entries, already filtered to exclude index IDs)
+        for row in db_results {
+            if seen.insert(row.id) {
+                merged.push(row);
+                if merged.len() >= limit {
+                    return merged;
+                }
+            }
+        }
+
+        merged
+    }
+
+    /// Force query through SQLite only (for testing/debugging)
+    pub fn query_db_only(&self, builder: &QueryBuilder) -> Result<Vec<HistoryRow>, Error> {
+        let conn = self.pool.get()?;
+        self.search.search(&conn, builder)
+    }
+}
+
+/// Extension trait for QueryBuilder to support hybrid queries
+impl QueryBuilder {
+    /// Check if query is constrained to recent entries only
+    pub fn is_recent_only(&self) -> bool {
+        // Query is recent-only if it has:
+        // - session filter (sessions are bounded in index)
+        // - time range starting recently
+        // - explicit recent flag
+        self.session.is_some() || self.recent_only
     }
 }
 ```
 
 ### Memory Budget
 
+The in-memory index is bounded to prevent unbounded growth. Default configuration
+keeps the last 1000 commands in memory - queries for older entries use hybrid
+query fallback to SQLite.
+
 ```rust
 // config.rs
 pub struct IndexConfig {
-    /// Maximum entries in memory (default: 10,000)
+    /// Maximum entries in memory (default: 1,000 - user configurable)
+    /// Higher values = faster recent queries, more memory
+    /// Lower values = less memory, more SQLite fallback
     pub max_entries: usize,
     /// Evict entries older than this (default: 7 days)
     pub max_age: Duration,
     /// Memory limit for index (default: 50MB)
     pub memory_limit: usize,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1_000,  // Hybrid query handles overflow
+            max_age: Duration::from_secs(7 * 24 * 60 * 60),
+            memory_limit: 50 * 1024 * 1024,
+        }
+    }
 }
 ```
 
@@ -1496,8 +2149,10 @@ pub fn start_command(&self, argv: &str, dir: &Path) -> Result<HistoryId, Error> 
         params![self.host, dir.display().to_string()],
     )?;
 
+    // INSERT OR IGNORE provides idempotent insert - UUID uniqueness acts as
+    // deduplication key for offline queue replay and sync operations
     tx.execute(
-        "INSERT INTO history (uuid, session, command_id, place_id, start_time)
+        "INSERT OR IGNORE INTO history (uuid, session, command_id, place_id, start_time)
          SELECT ?1, ?2, c.id, p.id, ?3
          FROM commands c, places p
          WHERE c.argv = ?4 AND p.host = ?5 AND p.dir = ?6",
@@ -1619,13 +2274,17 @@ pub struct DaemonConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct IndexConfig {
-    /// Maximum entries in left-right index
+    /// Maximum entries in in-memory index (default: 1000)
+    /// Queries beyond this limit fall back to SQLite (hybrid query)
+    #[serde(default = "default_max_entries")]
     pub max_entries: usize,
     /// Evict entries older than (days)
     pub max_age_days: u32,
     /// Memory limit (bytes)
     pub memory_limit: usize,
 }
+
+fn default_max_entries() -> usize { 1000 }
 
 #[derive(Debug, Deserialize)]
 pub struct SearchConfig {
@@ -1808,7 +2467,10 @@ batch_interval_ms = 10           # Max wait before flush
 queue_capacity = 4096            # Lock-free queue size
 
 [index]
-max_entries = 10000              # Entries in left-right index
+# Maximum entries in in-memory index (default: 1000)
+# Queries for entries beyond this fall back to SQLite (hybrid query)
+# Increase for faster queries over recent history, decrease to save memory
+max_entries = 1000
 max_age_days = 7                 # Evict older entries
 memory_limit = 52428800          # 50MB
 
@@ -2155,17 +2817,94 @@ impl SearchBackend for GlobBackend {
     }
 }
 
+/// Pre-flight check for FTS5 availability
+///
+/// Called at daemon startup to check if FTS5 is available and provide
+/// clear diagnostics if not. Returns availability status and diagnostic info.
+pub fn check_fts5_availability(conn: &Connection) -> Fts5AvailabilityResult {
+    // Check 1: SQLite compiled with FTS5 support
+    let compile_check = conn.query_row(
+        "SELECT 1 FROM pragma_compile_options WHERE compile_options = 'ENABLE_FTS5'",
+        [],
+        |_| Ok(()),
+    ).is_ok();
+
+    if !compile_check {
+        return Fts5AvailabilityResult {
+            available: false,
+            reason: Fts5Unavailable::NotCompiled,
+            sqlite_version: get_sqlite_version(conn),
+            recommendation: "Install SQLite with FTS5 support or use backend = \"glob\" in config",
+        };
+    }
+
+    // Check 2: Can create FTS5 virtual table
+    let create_check = conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS _fts5_test USING fts5(test); DROP TABLE _fts5_test;"
+    ).is_ok();
+
+    if !create_check {
+        return Fts5AvailabilityResult {
+            available: false,
+            reason: Fts5Unavailable::CreateFailed,
+            sqlite_version: get_sqlite_version(conn),
+            recommendation: "FTS5 extension may not be loaded. Check SQLite configuration.",
+        };
+    }
+
+    Fts5AvailabilityResult {
+        available: true,
+        reason: Fts5Unavailable::Available,
+        sqlite_version: get_sqlite_version(conn),
+        recommendation: "",
+    }
+}
+
+#[derive(Debug)]
+pub struct Fts5AvailabilityResult {
+    pub available: bool,
+    pub reason: Fts5Unavailable,
+    pub sqlite_version: String,
+    pub recommendation: &'static str,
+}
+
+#[derive(Debug)]
+pub enum Fts5Unavailable {
+    Available,
+    NotCompiled,
+    CreateFailed,
+}
+
+fn get_sqlite_version(conn: &Connection) -> String {
+    conn.query_row("SELECT sqlite_version()", [], |row| row.get(0))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 /// Factory function to create search backend from config
 pub fn create_backend(config: &SearchConfig, conn: &Connection) -> Box<dyn SearchBackend> {
     match config.backend {
         SearchBackendType::Fts5 => {
-            let backend = Fts5Backend::new(
-                config.fts5_tokenizer.as_deref().unwrap_or("unicode61")
-            );
-            if backend.is_available(conn) {
+            // Pre-flight check with detailed diagnostics
+            let fts5_check = check_fts5_availability(conn);
+
+            if fts5_check.available {
+                let backend = Fts5Backend::new(
+                    config.fts5_tokenizer.as_deref().unwrap_or("unicode61")
+                );
+                tracing::info!(
+                    "FTS5 search enabled (SQLite {})",
+                    fts5_check.sqlite_version
+                );
                 return Box::new(backend);
             }
-            tracing::warn!("FTS5 not available, falling back to GLOB");
+
+            // FTS5 not available - log detailed warning
+            tracing::warn!(
+                "FTS5 not available (SQLite {}, reason: {:?}). {}. Falling back to GLOB.",
+                fts5_check.sqlite_version,
+                fts5_check.reason,
+                fts5_check.recommendation
+            );
         }
         SearchBackendType::Like => return Box::new(LikeBackend),
         SearchBackendType::Glob => {}
@@ -2453,18 +3192,27 @@ CREATE TABLE IF NOT EXISTS offline_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     queued_at INTEGER NOT NULL,          -- When queued (for ordering)
     request_type TEXT NOT NULL,          -- 'start' or 'finish'
-    request_json TEXT NOT NULL,          -- Full request payload
-    original_timestamp INTEGER NOT NULL  -- Original command timestamp
+    request_json TEXT NOT NULL,          -- Full request payload with shell-generated UUID
+    -- HLC timestamp for CRDT causal ordering (preserved on replay)
+    hlc_wall_time INTEGER NOT NULL,      -- HLC wall time (ms since epoch)
+    hlc_logical INTEGER NOT NULL,        -- HLC logical counter
+    hlc_node_id TEXT NOT NULL            -- HLC node ID (for CRDT)
 );
 
 CREATE INDEX IF NOT EXISTS offline_queue_order ON offline_queue(queued_at);
 ```
 
+**Key Design Decisions:**
+1. **Shell generates all UUIDs**: The shell generates `history_id` (UUIDv7) before sending to daemon. This prevents UUID collision between offline and online paths.
+2. **HLC stored in offline queue**: Preserves causal ordering when replaying. Without this, replayed commands would get "wrong" timestamps and break CRDT merge.
+3. **FinishCommand also queued**: Exit status is just as important as command start - queue both.
+
 **Shell implementation (ZSH example):**
 
 ```zsh
-# histdb.zsh - with offline queue support
+# histdb.zsh - with offline queue support, shell-generated UUIDs, and HLC
 typeset -g HISTDB_OFFLINE_DB="${XDG_DATA_HOME:-$HOME/.local/share}/histdb/offline.db"
+typeset -g HISTDB_LAST_HISTORY_ID=""  # Shell-generated UUID for correlation
 
 _histdb_ensure_offline_db() {
     [[ -f $HISTDB_OFFLINE_DB ]] && return
@@ -2475,24 +3223,47 @@ _histdb_ensure_offline_db() {
             queued_at INTEGER NOT NULL,
             request_type TEXT NOT NULL,
             request_json TEXT NOT NULL,
-            original_timestamp INTEGER NOT NULL
+            hlc_wall_time INTEGER NOT NULL,
+            hlc_logical INTEGER NOT NULL,
+            hlc_node_id TEXT NOT NULL
         );
     "
 }
 
+# Generate UUIDv7 using CLI helper (shell generates, not daemon)
+_histdb_generate_uuid() {
+    histdb-cli session-id  # Reuse session-id command for UUIDv7 generation
+}
+
+# Get current HLC from daemon (or generate locally if offline)
+_histdb_get_hlc() {
+    local hlc_json
+    hlc_json=$(histdb-cli hlc-now 2>/dev/null)
+    if [[ -n "$hlc_json" ]]; then
+        print -- "$hlc_json"
+    else
+        # Offline: generate local HLC (wall time only, logical=0)
+        local wall_ms=$(($(date +%s) * 1000))
+        print -- '{"wall_time":'$wall_ms',"logical":0,"node_id":"'$HISTDB_SESSION'"}'
+    fi
+}
+
 _histdb_queue_offline() {
-    local request_type="$1" json="$2" timestamp="$3"
+    local request_type="$1" json="$2" hlc_json="$3"
     _histdb_ensure_offline_db
     # Use CLI helper for safe parameter binding (prevents SQL injection)
     histdb-cli offline-queue \
         --db "$HISTDB_OFFLINE_DB" \
         --type "$request_type" \
         --json "$json" \
-        --timestamp "$timestamp"
+        --hlc "$hlc_json"
 }
 
 _histdb_send_or_queue() {
-    local json="$1" request_type="$2" timestamp="${3:-$(date +%s)}"
+    local json="$1" request_type="$2"
+
+    # Get HLC for this operation
+    local hlc_json=$(_histdb_get_hlc)
 
     # Try daemon first
     local resp=$(_histdb_send "$json" 2>/dev/null)
@@ -2501,24 +3272,105 @@ _histdb_send_or_queue() {
         return 0
     fi
 
-    # Queue for later - daemon will replay on next connection
-    _histdb_queue_offline "$request_type" "$json" "$timestamp"
+    # Queue for later - daemon will replay with preserved HLC
+    _histdb_queue_offline "$request_type" "$json" "$hlc_json"
     return 1
 }
 
-# Updated hook to use offline queue
+# Updated hook: shell generates history_id UUID
 _histdb_addhistory() {
     _histdb_init
     local cmd="${1[1,-2]}"
     [[ -z "$cmd" ]] && return 0
 
-    local timestamp=$(date +%s)
-    local json='{"type":"StartCommand","argv":"'${cmd//\"/\\\"}'",'
-    json+='"dir":"'${PWD//\"/\\\"}'","session_id":'$HISTDB_SESSION',"timestamp":'$timestamp'}'
+    # Shell generates UUID for this history entry (prevents offline/online collision)
+    HISTDB_LAST_HISTORY_ID=$(_histdb_generate_uuid)
 
-    local resp=$(_histdb_send_or_queue "$json" "start" "$timestamp")
-    HISTDB_LAST_ID=$(print -- "$resp" | jq -r '.id // empty')
+    local json='{"type":"StartCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'  # Shell-generated UUID
+    json+='"argv":"'${cmd//\"/\\\"}'",'
+    json+='"dir":"'${PWD//\"/\\\"}'","session_id":"'$HISTDB_SESSION'"}'
+
+    _histdb_send_or_queue "$json" "start"
     return 0
+}
+
+# FinishCommand also uses offline queue (previously fire-and-forget)
+_histdb_precmd() {
+    local status=$?
+    [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
+
+    local json='{"type":"FinishCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
+    json+='"exit_status":'$status'}'
+
+    # Queue FinishCommand too - don't lose exit status on daemon restart
+    _histdb_send_or_queue "$json" "finish"
+    HISTDB_LAST_HISTORY_ID=""
+}
+
+add-zsh-hook zshaddhistory _histdb_addhistory
+add-zsh-hook precmd _histdb_precmd
+```
+
+**CLI helper updates:**
+
+```rust
+// cli/offline.rs - updated for HLC support
+
+#[derive(Args)]
+pub struct OfflineQueueArgs {
+    #[arg(long)]
+    db: PathBuf,
+
+    #[arg(long, name = "TYPE")]
+    r#type: String,
+
+    #[arg(long)]
+    json: String,
+
+    /// HLC timestamp as JSON: {"wall_time":..., "logical":..., "node_id":"..."}
+    #[arg(long)]
+    hlc: String,
+}
+
+pub fn handle_offline_queue(args: OfflineQueueArgs) -> Result<()> {
+    let conn = Connection::open(&args.db)?;
+
+    // Parse HLC from JSON
+    let hlc: HlcJson = serde_json::from_str(&args.hlc)?;
+
+    conn.execute(
+        "INSERT INTO offline_queue (queued_at, request_type, request_json, hlc_wall_time, hlc_logical, hlc_node_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Utc::now().timestamp(),
+            &args.r#type,
+            &args.json,
+            hlc.wall_time,
+            hlc.logical,
+            &hlc.node_id,
+        ],
+    )?;
+
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct HlcJson {
+    wall_time: u64,
+    logical: u32,
+    node_id: String,
+}
+
+// New CLI command: get current HLC
+pub fn handle_hlc_now() {
+    // Connect to daemon and get HLC, or generate local one
+    let hlc = match get_daemon_hlc() {
+        Ok(hlc) => hlc,
+        Err(_) => HLC::local_now(),
+    };
+    println!("{}", serde_json::to_string(&hlc).unwrap());
 }
 ```
 
@@ -2647,6 +3499,32 @@ pub fn on_shell_connect(processor: &OfflineQueueProcessor) {
 - Original timestamps preserved (for correct history ordering)
 - Daemon scans on startup, shell connect, and every 30 seconds
 - Rate limited to 100 entries per scan cycle
+
+**Deduplication via UUID:**
+
+Replayed entries use `INSERT OR IGNORE` with the history UUID as the uniqueness key:
+- Shell generates UUID before queueing (see shell integration)
+- Same UUID may be queued multiple times (retries, reconnects)
+- `INSERT OR IGNORE` silently skips duplicates (no error, no overwrite)
+- This makes replay **idempotent** - safe to replay same entry multiple times
+
+```sql
+-- Deduplication constraint (from migration)
+ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
+
+-- Idempotent insert (used by replay and sync)
+INSERT OR IGNORE INTO history (uuid, session, command_id, place_id, start_time)
+SELECT ?, ?, c.id, p.id, ?
+FROM commands c, places p
+WHERE c.argv = ? AND p.host = ? AND p.dir = ?;
+-- Returns 0 rows changed if UUID already exists (duplicate silently ignored)
+```
+
+**Why this matters:**
+- Network retries won't create duplicate history entries
+- Offline queue replay can be safely interrupted and resumed
+- Sync from peers won't duplicate already-synced entries
+- Crash recovery is safe (just re-process the queue)
 - Partial replay safe (stops on first failure, resumes next scan)
 
 ---
@@ -2799,8 +3677,10 @@ pub struct ShutdownCoordinator {
 pub enum ShutdownPhase {
     /// Stop accepting new connections
     StopAccepting,
-    /// Drain pending work
+    /// Drain pending work from in-memory queue
     DrainQueues,
+    /// Process any pending offline queue entries
+    ProcessOfflineQueue,
     /// Flush to disk
     FlushStorage,
     /// Sync with peers (best effort)
@@ -2815,6 +3695,8 @@ pub struct ShutdownConfig {
     pub total_timeout: Duration,
     /// Time to drain queues
     pub drain_timeout: Duration,
+    /// Time to process offline queue
+    pub offline_queue_timeout: Duration,
     /// Time to flush storage
     pub flush_timeout: Duration,
     /// Time for peer sync (best effort)
@@ -2826,6 +3708,7 @@ impl Default for ShutdownConfig {
         Self {
             total_timeout: Duration::from_secs(10),
             drain_timeout: Duration::from_millis(500),
+            offline_queue_timeout: Duration::from_secs(2),  // Process pending offline entries
             flush_timeout: Duration::from_secs(2),
             sync_timeout: Duration::from_secs(1),
         }
@@ -2902,7 +3785,28 @@ impl ShutdownCoordinator {
         }
         tracing::debug!("Phase 2: Drained {} commands", report.commands_drained);
 
-        // Phase 3: Flush storage
+        // Phase 3: Process offline queue
+        // Process any queued offline entries before shutdown
+        let _ = self.notify_tx.send(ShutdownPhase::ProcessOfflineQueue);
+        let offline_result = tokio::time::timeout(
+            self.config.offline_queue_timeout,
+            Self::process_offline_queue(&offline_processor)
+        ).await;
+
+        match offline_result {
+            Ok(Ok(processed)) => {
+                report.offline_entries_processed = processed;
+                tracing::debug!("Phase 3: Processed {} offline entries", processed);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Offline queue processing failed: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("Offline queue processing timeout");
+            }
+        }
+
+        // Phase 4: Flush storage
         let _ = self.notify_tx.send(ShutdownPhase::FlushStorage);
         let flush_result = tokio::time::timeout(
             self.config.flush_timeout,
@@ -2913,9 +3817,9 @@ impl ShutdownCoordinator {
         if !report.storage_flushed {
             tracing::warn!("Storage flush timeout");
         }
-        tracing::debug!("Phase 3: Storage flush complete");
+        tracing::debug!("Phase 4: Storage flush complete");
 
-        // Phase 4: Sync with peers (best effort)
+        // Phase 5: Sync with peers (best effort)
         if let Some(ref sync) = sync {
             let _ = self.notify_tx.send(ShutdownPhase::SyncPeers);
             let sync_result = tokio::time::timeout(
@@ -2923,15 +3827,40 @@ impl ShutdownCoordinator {
                 sync.push_pending()
             ).await;
             report.peers_synced = sync_result.is_ok();
-            tracing::debug!("Phase 4: Peer sync {:?}", if report.peers_synced { "complete" } else { "timeout" });
+            tracing::debug!("Phase 5: Peer sync {:?}", if report.peers_synced { "complete" } else { "timeout" });
         }
 
-        // Phase 5: Final termination
+        // Phase 6: Final termination
         let _ = self.notify_tx.send(ShutdownPhase::Terminate);
 
         report.duration = start.elapsed();
         tracing::info!("Shutdown complete in {:?}", report.duration);
         report
+    }
+
+    /// Process pending offline queue entries
+    async fn process_offline_queue(
+        processor: &OfflineQueueProcessor,
+    ) -> Result<usize, Error> {
+        let mut processed = 0;
+
+        // Get all pending entries from offline queue
+        let entries = processor.get_pending_entries().await?;
+
+        for entry in entries {
+            match processor.replay_entry(&entry).await {
+                Ok(()) => {
+                    processor.mark_processed(entry.id).await?;
+                    processed += 1;
+                }
+                Err(e) => {
+                    // Log but continue - don't fail entire shutdown for one entry
+                    tracing::warn!("Failed to replay offline entry {}: {}", entry.id, e);
+                }
+            }
+        }
+
+        Ok(processed)
     }
 
     async fn wait_for_writer_idle(health: &WriterHealth) {
@@ -3313,6 +4242,10 @@ pub struct EntryData {
 }
 
 /// Last-Writer-Wins Register for mutable fields
+///
+/// Merge semantics:
+/// 1. Higher HLC timestamp wins
+/// 2. If timestamps equal, higher node_id wins (deterministic tie-breaker)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LWWRegister<T> {
     pub value: T,
@@ -3324,12 +4257,97 @@ impl<T: Clone> LWWRegister<T> {
         Self { value, timestamp }
     }
 
-    /// Merge with another register - highest timestamp wins
+    /// Merge with another register
+    ///
+    /// Resolution order:
+    /// 1. Higher HLC timestamp wins (wall_time, then logical counter)
+    /// 2. If HLC equal, higher node_id wins (lexicographic comparison)
+    ///
+    /// This ensures deterministic convergence even with clock skew.
     pub fn merge(&mut self, other: &Self) {
-        if other.timestamp > self.timestamp {
+        if self.should_take_other(&other.timestamp) {
             self.value = other.value.clone();
             self.timestamp = other.timestamp;
         }
+    }
+
+    /// Determine if other's timestamp should win
+    fn should_take_other(&self, other_ts: &HLC) -> bool {
+        // Primary: compare wall time
+        match other_ts.wall_time.cmp(&self.timestamp.wall_time) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+
+        // Secondary: compare logical counter
+        match other_ts.logical.cmp(&self.timestamp.logical) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+
+        // Tie-breaker: lexicographic node_id comparison
+        // Higher node_id wins - ensures deterministic convergence
+        other_ts.node_id > self.timestamp.node_id
+    }
+}
+
+#[cfg(test)]
+mod lww_tests {
+    use super::*;
+
+    #[test]
+    fn test_lww_higher_timestamp_wins() {
+        let mut reg1 = LWWRegister::new(
+            42,
+            HLC { wall_time: 100, logical: 0, node_id: "node-a".into() },
+        );
+        let reg2 = LWWRegister::new(
+            99,
+            HLC { wall_time: 200, logical: 0, node_id: "node-b".into() },
+        );
+
+        reg1.merge(&reg2);
+        assert_eq!(reg1.value, 99);
+    }
+
+    #[test]
+    fn test_lww_equal_time_node_id_tiebreaker() {
+        // Same wall_time and logical, different node_id
+        let mut reg1 = LWWRegister::new(
+            42,
+            HLC { wall_time: 100, logical: 5, node_id: "node-a".into() },
+        );
+        let reg2 = LWWRegister::new(
+            99,
+            HLC { wall_time: 100, logical: 5, node_id: "node-z".into() },
+        );
+
+        reg1.merge(&reg2);
+        // node-z > node-a lexicographically, so reg2 wins
+        assert_eq!(reg1.value, 99);
+    }
+
+    #[test]
+    fn test_lww_convergence_is_deterministic() {
+        // Both nodes start with different values, same timestamp
+        let ts_a = HLC { wall_time: 100, logical: 0, node_id: "node-a".into() };
+        let ts_b = HLC { wall_time: 100, logical: 0, node_id: "node-b".into() };
+
+        let mut node_a = LWWRegister::new("value-a", ts_a.clone());
+        let mut node_b = LWWRegister::new("value-b", ts_b.clone());
+
+        // Cross-merge in any order
+        let node_b_copy = node_b.clone();
+        node_a.merge(&node_b_copy);
+
+        let node_a_copy = LWWRegister::new("value-a", ts_a);
+        node_b.merge(&node_a_copy);
+
+        // Both nodes converge to same value (node-b wins, higher node_id)
+        assert_eq!(node_a.value, node_b.value);
+        assert_eq!(node_a.value, "value-b");
     }
 }
 
@@ -3985,17 +5003,50 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 /// Noise protocol pattern: KK (both sides know each other's static key)
 const NOISE_PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
 
+/// Handshake timeout configuration
+#[derive(Debug, Clone)]
+pub struct HandshakeConfig {
+    /// Total timeout for handshake (default: 10s)
+    pub timeout: Duration,
+    /// Per-message timeout within handshake (default: 5s)
+    pub message_timeout: Duration,
+}
+
+impl Default for HandshakeConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(10),
+            message_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 pub struct SecureChannel {
     transport: TransportState,
     peer_pubkey: VerifyingKey,
 }
 
 impl SecureChannel {
-    /// Initiate connection to known peer
-    pub fn connect(
+    /// Initiate connection to known peer with timeout
+    pub async fn connect(
         our_key: &SigningKey,
         peer_pubkey: &VerifyingKey,
         stream: TcpStream,
+        config: &HandshakeConfig,
+    ) -> Result<Self, Error> {
+        // Wrap entire handshake in timeout
+        tokio::time::timeout(config.timeout, async {
+            Self::connect_inner(our_key, peer_pubkey, stream, config).await
+        })
+        .await
+        .map_err(|_| Error::HandshakeTimeout)?
+    }
+
+    async fn connect_inner(
+        our_key: &SigningKey,
+        peer_pubkey: &VerifyingKey,
+        mut stream: TcpStream,
+        config: &HandshakeConfig,
     ) -> Result<Self, Error> {
         let builder = Builder::new(NOISE_PATTERN.parse()?)
             .local_private_key(&our_key.to_bytes())
@@ -4003,23 +5054,45 @@ impl SecureChannel {
 
         let mut handshake = builder.build_initiator()?;
 
-        // Two-round handshake
+        // Two-round handshake with per-message timeouts
         let mut buf = [0u8; 65535];
-        let len = handshake.write_message(&[], &mut buf)?;
-        stream.write_all(&buf[..len])?;
 
-        let len = stream.read(&mut buf)?;
+        // Round 1: Send -> e, es
+        let len = handshake.write_message(&[], &mut buf)?;
+        tokio::time::timeout(config.message_timeout, stream.write_all(&buf[..len]))
+            .await
+            .map_err(|_| Error::HandshakeTimeout)??;
+
+        // Round 2: Recv <- e, ee
+        let len = tokio::time::timeout(config.message_timeout, stream.read(&mut buf))
+            .await
+            .map_err(|_| Error::HandshakeTimeout)??;
         handshake.read_message(&buf[..len], &mut [])?;
 
         let transport = handshake.into_transport_mode()?;
         Ok(Self { transport, peer_pubkey: *peer_pubkey })
     }
 
-    /// Accept connection, verify peer is in known_peers list
-    pub fn accept(
+    /// Accept connection with timeout, verify peer is in known_peers list
+    pub async fn accept(
         our_key: &SigningKey,
         known_peers: &[VerifyingKey],
         stream: TcpStream,
+        config: &HandshakeConfig,
+    ) -> Result<Self, Error> {
+        // Wrap entire handshake in timeout
+        tokio::time::timeout(config.timeout, async {
+            Self::accept_inner(our_key, known_peers, stream, config).await
+        })
+        .await
+        .map_err(|_| Error::HandshakeTimeout)?
+    }
+
+    async fn accept_inner(
+        our_key: &SigningKey,
+        known_peers: &[VerifyingKey],
+        mut stream: TcpStream,
+        config: &HandshakeConfig,
     ) -> Result<Self, Error> {
         let builder = Builder::new(NOISE_PATTERN.parse()?)
             .local_private_key(&our_key.to_bytes());
@@ -4027,7 +5100,11 @@ impl SecureChannel {
         let mut handshake = builder.build_responder()?;
 
         let mut buf = [0u8; 65535];
-        let len = stream.read(&mut buf)?;
+
+        // Round 1: Recv <- e, es (with timeout)
+        let len = tokio::time::timeout(config.message_timeout, stream.read(&mut buf))
+            .await
+            .map_err(|_| Error::HandshakeTimeout)??;
         handshake.read_message(&buf[..len], &mut [])?;
 
         // Verify peer is in known_peers list
@@ -4038,12 +5115,34 @@ impl SecureChannel {
             return Err(Error::UnknownPeer);
         }
 
+        // Round 2: Send -> e, ee (with timeout)
         let len = handshake.write_message(&[], &mut buf)?;
-        stream.write_all(&buf[..len])?;
+        tokio::time::timeout(config.message_timeout, stream.write_all(&buf[..len]))
+            .await
+            .map_err(|_| Error::HandshakeTimeout)??;
 
         let transport = handshake.into_transport_mode()?;
         Ok(Self { transport, peer_pubkey: peer_key })
     }
+}
+
+/// Handshake errors
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Handshake timed out")]
+    HandshakeTimeout,
+
+    #[error("No peer public key in handshake")]
+    NoPeerKey,
+
+    #[error("Unknown peer - not in known_peers list")]
+    UnknownPeer,
+
+    #[error("Noise protocol error: {0}")]
+    Noise(#[from] snow::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 ```
 
@@ -4168,6 +5267,74 @@ pub struct Heartbeat {
 16s     Codespace reconnects to Desktop via mDNS discovery
 17s     Sync continues (CRDTs merge any divergence)
 ```
+
+#### Split-Brain Behavior (Availability > Consistency)
+
+histdb explicitly chooses **availability over consistency** during network partitions.
+This is the correct tradeoff for command history:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Split-Brain Scenario                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Before Partition:            During Partition:           After Reconnect:  │
+│                                                                              │
+│  ┌─────────┐                  ┌─────────┐                ┌─────────┐        │
+│  │ Desktop │                  │ Desktop │                │ Desktop │        │
+│  │ leader  │◄──────────────── │ leader  │                │ merged  │        │
+│  └────┬────┘     Network      │ writes  │                └────┬────┘        │
+│       │          Split        │ locally │                     │             │
+│       │            ↓          └─────────┘    CRDT Merge  ┌────┴────┐        │
+│  ┌────┴────┐                  ┌─────────┐        ↓       │ Desktop │        │
+│  │ Laptop  │                  │ Laptop  │    ═══════►    │   +     │        │
+│  │ follower│                  │ leader  │                │ Laptop  │        │
+│  └─────────┘                  │ writes  │                │ entries │        │
+│                               │ locally │                └─────────┘        │
+│                               └─────────┘                                   │
+│                                                                              │
+│  Single leader               Two independent             All entries        │
+│                              leaders (split-brain)       merged             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**What happens during split-brain:**
+
+| Phase | Desktop Side | Laptop Side |
+|-------|--------------|-------------|
+| Normal operation | Leader, syncs to Laptop | Follower, receives from Desktop |
+| Network partition | Continues as leader | Detects timeout, becomes leader |
+| Both sides | Writes accepted locally | Writes accepted locally |
+| Reconnect | Discovers Laptop has entries | Discovers Desktop has entries |
+| Merge | CRDT merge (union of entries) | Same merge result |
+
+**Why this is correct for histdb:**
+
+1. **No data loss**: Both sides continue recording commands - nothing is dropped
+2. **Automatic resolution**: CRDT merge requires no manual intervention
+3. **User expectation**: Users expect their commands to be recorded regardless of network
+4. **Eventual consistency**: After reconnect, all machines have the same complete history
+
+**What CRDT merge does:**
+
+- **History entries (G-Set)**: Union of all entries from both sides
+- **Exit status (LWW-Register)**: Higher HLC timestamp wins, node_id as tie-breaker
+- **No conflicts**: Every command has a globally unique UUID, no overwrites
+
+**Documented behavior:**
+
+> During network partitions, histdb may elect multiple leaders (split-brain).
+> Each partition continues recording commands independently.
+> On reconnect, all entries are merged via CRDT semantics.
+> This is by design: availability and durability of command history
+> is prioritized over strong consistency.
+
+**Edge case - identical timestamps:**
+
+If two machines record a command at exactly the same HLC (same wall_time,
+same logical counter), the LWW-Register uses node_id as a deterministic
+tie-breaker (see "CRDT LWW Tie-Breaker" section).
 
 ### Ephemeral Machine Support
 
