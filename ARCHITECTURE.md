@@ -700,6 +700,31 @@ This balances the write-heavy ingestion with read-heavy queries.
 ```rust
 // read/left_right.rs
 use left_right::{ReadHandle, WriteHandle};
+use std::mem::size_of;
+
+/// Memory bounds configuration for the left-right index
+#[derive(Clone, Debug)]
+pub struct IndexBounds {
+    /// Maximum number of entries
+    pub max_entries: usize,
+    /// Maximum memory usage (bytes, approximate)
+    pub max_memory_bytes: usize,
+    /// Maximum age of entries (seconds)
+    pub max_age_secs: u64,
+    /// Maximum entries per session
+    pub max_per_session: usize,
+}
+
+impl Default for IndexBounds {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            max_memory_bytes: 50 * 1024 * 1024,  // 50MB
+            max_age_secs: 7 * 24 * 60 * 60,      // 7 days
+            max_per_session: 1000,
+        }
+    }
+}
 
 /// In-memory index of recent history for fast queries
 pub struct HistoryIndex {
@@ -711,6 +736,123 @@ pub struct HistoryIndex {
     by_dir: HashMap<Box<Path>, Vec<EntryId>>,
     /// Last N entries per session (for isearch)
     by_session: HashMap<SessionId, VecDeque<EntryId>>,  // SessionId is Uuid
+    /// Memory bounds configuration
+    bounds: IndexBounds,
+    /// Current estimated memory usage
+    estimated_memory: usize,
+}
+
+impl HistoryIndex {
+    pub fn new(bounds: IndexBounds) -> Self {
+        Self {
+            recent: Vec::with_capacity(bounds.max_entries.min(1000)),
+            by_command: HashMap::new(),
+            by_dir: HashMap::new(),
+            by_session: HashMap::new(),
+            bounds,
+            estimated_memory: 0,
+        }
+    }
+
+    /// Estimate memory used by an entry
+    fn entry_memory_size(entry: &RecentEntry) -> usize {
+        size_of::<RecentEntry>()
+            + entry.argv.len()
+            + entry.dir.as_os_str().len()
+            + entry.host.len()
+            + 16 * 3  // UUID storage overhead in maps
+    }
+
+    /// Check if eviction is needed
+    pub fn needs_eviction(&self) -> bool {
+        self.recent.len() >= self.bounds.max_entries
+            || self.estimated_memory >= self.bounds.max_memory_bytes
+    }
+
+    /// Evict entries to stay within bounds
+    pub fn evict_if_needed(&mut self) {
+        let now = chrono::Utc::now().timestamp();
+        let age_threshold = now - self.bounds.max_age_secs as i64;
+
+        // Phase 1: Evict by age
+        let before_count = self.recent.len();
+        self.evict_older_than(age_threshold);
+
+        // Phase 2: Evict by count if still over
+        while self.recent.len() > self.bounds.max_entries {
+            self.evict_oldest_entry();
+        }
+
+        // Phase 3: Evict by memory if still over
+        while self.estimated_memory > self.bounds.max_memory_bytes && !self.recent.is_empty() {
+            self.evict_oldest_entry();
+        }
+
+        if self.recent.len() < before_count {
+            tracing::debug!(
+                "Evicted {} entries, now at {} entries, ~{} bytes",
+                before_count - self.recent.len(),
+                self.recent.len(),
+                self.estimated_memory
+            );
+        }
+    }
+
+    fn evict_older_than(&mut self, threshold: i64) {
+        let to_remove: Vec<_> = self.recent.iter()
+            .filter(|e| e.start_time < threshold)
+            .map(|e| e.id)
+            .collect();
+
+        for id in to_remove {
+            self.remove_entry(id);
+        }
+    }
+
+    fn evict_oldest_entry(&mut self) {
+        if let Some(oldest) = self.recent.iter().min_by_key(|e| e.start_time) {
+            let id = oldest.id;
+            self.remove_entry(id);
+        }
+    }
+
+    fn remove_entry(&mut self, id: EntryId) {
+        if let Some(pos) = self.recent.iter().position(|e| e.id == id) {
+            let entry = self.recent.remove(pos);
+            self.estimated_memory -= Self::entry_memory_size(&entry);
+
+            // Clean up maps
+            if let Some(ids) = self.by_command.get_mut(&entry.argv) {
+                ids.retain(|&eid| eid != id);
+            }
+            if let Some(ids) = self.by_dir.get_mut(&entry.dir) {
+                ids.retain(|&eid| eid != id);
+            }
+            if let Some(ids) = self.by_session.get_mut(&entry.session) {
+                ids.retain(|&eid| eid != id);
+            }
+        }
+    }
+
+    /// Get current statistics
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            entry_count: self.recent.len(),
+            estimated_memory_bytes: self.estimated_memory,
+            unique_commands: self.by_command.len(),
+            unique_directories: self.by_dir.len(),
+            active_sessions: self.by_session.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStats {
+    pub entry_count: usize,
+    pub estimated_memory_bytes: usize,
+    pub unique_commands: usize,
+    pub unique_directories: usize,
+    pub active_sessions: usize,
 }
 
 #[derive(Clone)]
@@ -729,12 +871,16 @@ pub enum IndexOp {
     Insert(RecentEntry),
     UpdateExitStatus { id: EntryId, status: i32, duration: u64 },
     Evict { before: i64 },  // Evict entries older than timestamp
+    EvictIfNeeded,          // Check bounds and evict as needed
 }
 
 impl Absorb<IndexOp> for HistoryIndex {
     fn absorb_first(&mut self, op: &mut IndexOp, _: &Self) {
         match op {
             IndexOp::Insert(entry) => {
+                // Track memory
+                self.estimated_memory += Self::entry_memory_size(entry);
+
                 self.by_command
                     .entry(entry.argv.clone())
                     .or_default()
@@ -743,27 +889,43 @@ impl Absorb<IndexOp> for HistoryIndex {
                     .entry(entry.dir.clone())
                     .or_default()
                     .push(entry.id);
-                self.by_session
+
+                // Enforce per-session limit
+                let session_entries = self.by_session
                     .entry(entry.session)
-                    .or_default()
-                    .push_back(entry.id);
+                    .or_default();
+                if session_entries.len() >= self.bounds.max_per_session {
+                    // Evict oldest from this session
+                    if let Some(old_id) = session_entries.pop_front() {
+                        self.remove_entry(old_id);
+                    }
+                }
+                session_entries.push_back(entry.id);
+
                 self.recent.push(entry.clone());
+
+                // Check bounds after insert
+                if self.needs_eviction() {
+                    self.evict_if_needed();
+                }
             }
-            IndexOp::UpdateExitStatus { id, status, duration } => {
+            IndexOp::UpdateExitStatus { id, status, .. } => {
                 if let Some(entry) = self.recent.iter_mut().find(|e| e.id == *id) {
                     entry.exit_status = Some(*status);
                 }
             }
             IndexOp::Evict { before } => {
-                self.recent.retain(|e| e.start_time >= *before);
-                // Also clean up maps...
+                self.evict_older_than(*before);
+            }
+            IndexOp::EvictIfNeeded => {
+                self.evict_if_needed();
             }
         }
     }
 
     fn absorb_second(&mut self, op: IndexOp, other: &Self) {
         // Same logic, can optimize by copying from `other`
-        self.absorb_first(&mut op, other);
+        self.absorb_first(&mut { op }, other);
     }
 }
 
@@ -977,27 +1139,287 @@ pub struct HistoryEntry {
 ```
 
 #### Migrations
+
 ```rust
 // migrations.rs
+
+/// Migration direction for rollback support
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationDirection {
+    Up,
+    Down,
+}
+
+/// A database migration with up and down SQL
+#[derive(Debug)]
+pub struct Migration {
+    /// Migration version number (sequential)
+    pub version: u32,
+    /// Human-readable name
+    pub name: &'static str,
+    /// SQL to apply the migration
+    pub up: &'static str,
+    /// SQL to rollback the migration (required for reversibility)
+    pub down: &'static str,
+    /// Whether this migration is destructive (requires backup)
+    pub destructive: bool,
+}
+
+/// Migration error types
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    #[error("Migration {0} failed: {1}")]
+    ExecutionFailed(u32, String),
+
+    #[error("Rollback of migration {0} failed: {1}")]
+    RollbackFailed(u32, String),
+
+    #[error("Backup failed: {0}")]
+    BackupFailed(String),
+
+    #[error("Database version {current} is newer than supported {supported}")]
+    VersionTooNew { current: u32, supported: u32 },
+
+    #[error("Missing rollback SQL for migration {0}")]
+    NoRollbackSql(u32),
+
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}
+
+/// Migration result with rollback information
+#[derive(Debug)]
+pub struct MigrationResult {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub migrations_applied: Vec<u32>,
+    pub backup_path: Option<PathBuf>,
+}
+
 pub struct Migrator {
     conn: Connection,
-    migrations_dir: PathBuf,
+    migrations: Vec<Migration>,
+    backup_dir: PathBuf,
 }
 
 impl Migrator {
-    /// Run migrations with automatic rollback on failure
-    pub fn migrate(&mut self) -> Result<(), MigrationError>;
+    pub fn new(conn: Connection, backup_dir: PathBuf) -> Self {
+        Self {
+            conn,
+            migrations: Self::all_migrations(),
+            backup_dir,
+        }
+    }
 
-    /// Create backup before destructive migrations
-    pub fn backup(&self, suffix: &str) -> Result<PathBuf, Error>;
+    /// Get current database version
+    pub fn current_version(&self) -> Result<u32, MigrationError> {
+        let version: i32 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        Ok(version as u32)
+    }
+
+    /// Get latest supported version
+    pub fn latest_version(&self) -> u32 {
+        self.migrations.last().map(|m| m.version).unwrap_or(0)
+    }
+
+    /// Run all pending migrations (up direction)
+    pub fn migrate(&mut self) -> Result<MigrationResult, MigrationError> {
+        let current = self.current_version()?;
+        let latest = self.latest_version();
+
+        // Check for newer database
+        if current > latest {
+            return Err(MigrationError::VersionTooNew {
+                current,
+                supported: latest,
+            });
+        }
+
+        if current == latest {
+            return Ok(MigrationResult {
+                from_version: current,
+                to_version: current,
+                migrations_applied: vec![],
+                backup_path: None,
+            });
+        }
+
+        // Check if any pending migration is destructive
+        let has_destructive = self.migrations.iter()
+            .filter(|m| m.version > current)
+            .any(|m| m.destructive);
+
+        // Create backup if needed
+        let backup_path = if has_destructive {
+            Some(self.backup(&format!("pre_migration_v{}", current))?)
+        } else {
+            None
+        };
+
+        // Apply migrations in order
+        let mut applied = Vec::new();
+        for migration in self.migrations.iter().filter(|m| m.version > current) {
+            match self.apply_migration(migration, MigrationDirection::Up) {
+                Ok(()) => {
+                    applied.push(migration.version);
+                    tracing::info!("Applied migration {}: {}", migration.version, migration.name);
+                }
+                Err(e) => {
+                    // Rollback applied migrations
+                    tracing::error!("Migration {} failed: {}, rolling back", migration.version, e);
+                    self.rollback_migrations(&applied)?;
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(MigrationResult {
+            from_version: current,
+            to_version: latest,
+            migrations_applied: applied,
+            backup_path,
+        })
+    }
+
+    /// Rollback to a specific version
+    pub fn rollback_to(&mut self, target_version: u32) -> Result<MigrationResult, MigrationError> {
+        let current = self.current_version()?;
+
+        if target_version >= current {
+            return Ok(MigrationResult {
+                from_version: current,
+                to_version: current,
+                migrations_applied: vec![],
+                backup_path: None,
+            });
+        }
+
+        // Create backup before rollback
+        let backup_path = self.backup(&format!("pre_rollback_v{}", current))?;
+
+        // Collect migrations to rollback (in reverse order)
+        let to_rollback: Vec<_> = self.migrations.iter()
+            .filter(|m| m.version > target_version && m.version <= current)
+            .collect();
+
+        let mut rolled_back = Vec::new();
+        for migration in to_rollback.into_iter().rev() {
+            if migration.down.is_empty() {
+                return Err(MigrationError::NoRollbackSql(migration.version));
+            }
+
+            match self.apply_migration(migration, MigrationDirection::Down) {
+                Ok(()) => {
+                    rolled_back.push(migration.version);
+                    tracing::info!("Rolled back migration {}: {}", migration.version, migration.name);
+                }
+                Err(e) => {
+                    tracing::error!("Rollback of migration {} failed: {}", migration.version, e);
+                    return Err(MigrationError::RollbackFailed(migration.version, e.to_string()));
+                }
+            }
+        }
+
+        Ok(MigrationResult {
+            from_version: current,
+            to_version: target_version,
+            migrations_applied: rolled_back,
+            backup_path: Some(backup_path),
+        })
+    }
+
+    /// Apply a single migration in the specified direction
+    fn apply_migration(&self, migration: &Migration, direction: MigrationDirection) -> Result<(), MigrationError> {
+        let sql = match direction {
+            MigrationDirection::Up => migration.up,
+            MigrationDirection::Down => migration.down,
+        };
+
+        // Run in transaction
+        let tx = self.conn.transaction()?;
+
+        tx.execute_batch(sql)
+            .map_err(|e| MigrationError::ExecutionFailed(migration.version, e.to_string()))?;
+
+        // Update version
+        let new_version = match direction {
+            MigrationDirection::Up => migration.version,
+            MigrationDirection::Down => migration.version - 1,
+        };
+        tx.pragma_update(None, "user_version", new_version)?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rollback a list of migrations (in reverse order)
+    fn rollback_migrations(&self, versions: &[u32]) -> Result<(), MigrationError> {
+        for &version in versions.iter().rev() {
+            if let Some(migration) = self.migrations.iter().find(|m| m.version == version) {
+                self.apply_migration(migration, MigrationDirection::Down)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a backup of the database
+    pub fn backup(&self, suffix: &str) -> Result<PathBuf, MigrationError> {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let backup_name = format!("history_{}_{}.db", timestamp, suffix);
+        let backup_path = self.backup_dir.join(&backup_name);
+
+        // Use SQLite's backup API
+        self.conn.backup(DatabaseName::Main, &backup_path, None)
+            .map_err(|e| MigrationError::BackupFailed(e.to_string()))?;
+
+        tracing::info!("Created backup: {}", backup_path.display());
+        Ok(backup_path)
+    }
+
+    /// Define all migrations
+    fn all_migrations() -> Vec<Migration> {
+        vec![
+            Migration {
+                version: 1,
+                name: "initial_schema",
+                up: include_str!("../migrations/001_initial.up.sql"),
+                down: include_str!("../migrations/001_initial.down.sql"),
+                destructive: false,
+            },
+            Migration {
+                version: 2,
+                name: "add_fts5_search",
+                up: include_str!("../migrations/002_fts5.up.sql"),
+                down: include_str!("../migrations/002_fts5.down.sql"),
+                destructive: false,
+            },
+            Migration {
+                version: 3,
+                name: "add_uuid_columns",
+                up: include_str!("../migrations/003_uuid.up.sql"),
+                down: include_str!("../migrations/003_uuid.down.sql"),
+                destructive: false,
+            },
+            Migration {
+                version: 4,
+                name: "add_sync_tables",
+                up: include_str!("../migrations/004_sync.up.sql"),
+                down: include_str!("../migrations/004_sync.down.sql"),
+                destructive: false,
+            },
+        ]
+    }
 }
 ```
 
 **Key safety features:**
-- All migrations run in a transaction
-- Automatic rollback on failure
-- Backup created before schema changes
+- All migrations run in a transaction (atomic apply/rollback)
+- Every migration has both `up` and `down` SQL
+- Automatic rollback on failure during migration sequence
+- Backup created before destructive migrations
 - Version tracking via `user_version` pragma
+- Explicit `rollback_to(version)` for manual rollback
+- Version compatibility check (prevents running against newer DB)
 
 ---
 
@@ -1221,6 +1643,37 @@ pub struct IgnoreConfig {
     pub space_prefix: bool,
 }
 
+/// Configuration validation errors
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigValidationError {
+    #[error("database.path: parent directory does not exist: {0}")]
+    DatabasePathInvalid(PathBuf),
+
+    #[error("daemon.socket_path: parent directory does not exist: {0}")]
+    SocketPathInvalid(PathBuf),
+
+    #[error("daemon.batch_size: must be between 1 and 1000, got {0}")]
+    BatchSizeInvalid(usize),
+
+    #[error("daemon.batch_interval_ms: must be between 1 and 1000, got {0}")]
+    BatchIntervalInvalid(u64),
+
+    #[error("daemon.queue_capacity: must be power of 2 between 64 and 65536, got {0}")]
+    QueueCapacityInvalid(usize),
+
+    #[error("index.max_entries: must be between 100 and 1000000, got {0}")]
+    MaxEntriesInvalid(usize),
+
+    #[error("index.memory_limit: must be at least 1MB, got {0} bytes")]
+    MemoryLimitTooSmall(usize),
+
+    #[error("ignore.patterns: invalid regex at index {0}: {1}")]
+    InvalidIgnorePattern(usize, String),
+
+    #[error("search.backend: unknown backend type: {0}")]
+    UnknownSearchBackend(String),
+}
+
 impl Config {
     /// Load from ~/.config/histdb/config.toml with env overrides
     pub fn load() -> Result<Self, ConfigError> {
@@ -1243,7 +1696,98 @@ impl Config {
             config.daemon.socket_path = PathBuf::from(socket);
         }
 
+        // Validate configuration
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// Validate all configuration values
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.validate_database()?;
+        self.validate_daemon()?;
+        self.validate_index()?;
+        self.validate_search()?;
+        self.validate_ignore()?;
+        Ok(())
+    }
+
+    fn validate_database(&self) -> Result<(), ConfigValidationError> {
+        // Expand ~ in path
+        let expanded = shellexpand::tilde(&self.database.path.to_string_lossy());
+        let path = PathBuf::from(expanded.as_ref());
+
+        // Check parent directory exists or can be created
+        if let Some(parent) = path.parent() {
+            if !parent.exists() && parent != Path::new("") {
+                // Try to create parent directory
+                if std::fs::create_dir_all(parent).is_err() {
+                    return Err(ConfigValidationError::DatabasePathInvalid(
+                        parent.to_path_buf()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_daemon(&self) -> Result<(), ConfigValidationError> {
+        // Validate socket path parent
+        if let Some(parent) = self.daemon.socket_path.parent() {
+            if !parent.exists() && parent != Path::new("") {
+                return Err(ConfigValidationError::SocketPathInvalid(
+                    parent.to_path_buf()
+                ));
+            }
+        }
+
+        // Validate batch size (1-1000)
+        if self.daemon.batch_size == 0 || self.daemon.batch_size > 1000 {
+            return Err(ConfigValidationError::BatchSizeInvalid(self.daemon.batch_size));
+        }
+
+        // Validate batch interval (1-1000ms)
+        if self.daemon.batch_interval_ms == 0 || self.daemon.batch_interval_ms > 1000 {
+            return Err(ConfigValidationError::BatchIntervalInvalid(self.daemon.batch_interval_ms));
+        }
+
+        // Validate queue capacity (power of 2, 64-65536)
+        let cap = self.daemon.queue_capacity;
+        if cap < 64 || cap > 65536 || !cap.is_power_of_two() {
+            return Err(ConfigValidationError::QueueCapacityInvalid(cap));
+        }
+
+        Ok(())
+    }
+
+    fn validate_index(&self) -> Result<(), ConfigValidationError> {
+        // Validate max entries (100-1M)
+        if self.index.max_entries < 100 || self.index.max_entries > 1_000_000 {
+            return Err(ConfigValidationError::MaxEntriesInvalid(self.index.max_entries));
+        }
+
+        // Validate memory limit (at least 1MB)
+        if self.index.memory_limit < 1_048_576 {
+            return Err(ConfigValidationError::MemoryLimitTooSmall(self.index.memory_limit));
+        }
+
+        Ok(())
+    }
+
+    fn validate_search(&self) -> Result<(), ConfigValidationError> {
+        // Backend is already typed via SearchBackendType enum
+        // Additional validation could check FTS5 tokenizer names
+        Ok(())
+    }
+
+    fn validate_ignore(&self) -> Result<(), ConfigValidationError> {
+        // Validate all regex patterns compile
+        for (i, pattern) in self.ignore.patterns.iter().enumerate() {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(ConfigValidationError::InvalidIgnorePattern(i, e.to_string()));
+            }
+        }
+        Ok(())
     }
 }
 ```
@@ -1317,10 +1861,6 @@ pub enum Cli {
     #[command(name = "offline-queue")]
     OfflineQueue(OfflineQueueArgs),
 
-    /// Replay queued commands to daemon (shell helper)
-    #[command(name = "offline-replay")]
-    OfflineReplay(OfflineReplayArgs),
-
     /// Generate a new session ID (UUIDv7)
     #[command(name = "session-id")]
     SessionId,
@@ -1387,14 +1927,6 @@ pub struct OfflineQueueArgs {
     #[arg(long)]
     timestamp: i64,
 }
-
-/// Arguments for offline-replay command (shell helper)
-#[derive(Args)]
-pub struct OfflineReplayArgs {
-    /// Path to offline queue database
-    #[arg(long)]
-    db: PathBuf,
-}
 ```
 
 **Offline queue command implementation:**
@@ -1431,39 +1963,13 @@ pub fn handle_offline_queue(args: OfflineQueueArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_offline_replay(args: OfflineReplayArgs) -> Result<()> {
-    let conn = Connection::open(&args.db)?;
-
-    // Get queued commands in order
-    let mut stmt = conn.prepare(
-        "SELECT id, request_json FROM offline_queue ORDER BY queued_at"
-    )?;
-
-    let entries: Vec<(i64, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-
-    for (id, json) in entries {
-        // Try to send to daemon
-        match send_to_daemon(&json) {
-            Ok(_) => {
-                // Delete successfully replayed entry
-                conn.execute("DELETE FROM offline_queue WHERE id = ?1", params![id])?;
-            }
-            Err(_) => {
-                // Daemon unavailable, stop replay
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub fn handle_session_id() {
     // Generate and print UUIDv7
     println!("{}", Uuid::now_v7());
 }
+
+// Note: Offline replay is handled by the daemon (OfflineQueueProcessor),
+// not the CLI - see daemon/offline.rs
 ```
 
 ---
@@ -1928,10 +2434,12 @@ This provides **near 100% reliability** - no commands are lost.
 │   │ ~/.local/share/histdb/offline.db     │                              │
 │   └──────────────────────────────────────┘                              │
 │          │                                                               │
-│          ▼ (on next successful daemon connect)                          │
+│          ▼ (daemon handles replay on startup/connect)                   │
 │   ┌──────────────────────────────────────┐                              │
-│   │ Replay queued commands to daemon     │                              │
-│   │ (in order, with original timestamps) │                              │
+│   │ Daemon scans offline queue           │                              │
+│   │ - On startup                         │                              │
+│   │ - On new shell connection            │                              │
+│   │ - Periodic background scan           │                              │
 │   └──────────────────────────────────────┘                              │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -1983,25 +2491,17 @@ _histdb_queue_offline() {
         --timestamp "$timestamp"
 }
 
-_histdb_replay_offline() {
-    [[ -f $HISTDB_OFFLINE_DB ]] || return
-    # Use CLI helper to replay queued commands (handles all SQL safely)
-    histdb-cli offline-replay --db "$HISTDB_OFFLINE_DB"
-}
-
 _histdb_send_or_queue() {
     local json="$1" request_type="$2" timestamp="${3:-$(date +%s)}"
 
     # Try daemon first
     local resp=$(_histdb_send "$json" 2>/dev/null)
     if [[ -n "$resp" ]]; then
-        # Success - also try to replay any queued commands
-        _histdb_replay_offline &!
         print -- "$resp"
         return 0
     fi
 
-    # Queue for later
+    # Queue for later - daemon will replay on next connection
     _histdb_queue_offline "$request_type" "$json" "$timestamp"
     return 1
 }
@@ -2022,11 +2522,132 @@ _histdb_addhistory() {
 }
 ```
 
+**Daemon-driven replay:**
+
+The daemon is responsible for processing offline queues, not the shell. This ensures:
+- Centralized control over replay timing and rate limiting
+- No shell startup latency from replay
+- Consistent handling across all shell types
+
+```rust
+// daemon/offline.rs
+
+/// Offline queue processor - runs as background task in daemon
+pub struct OfflineQueueProcessor {
+    db_path: PathBuf,
+    ingest_queue: Arc<CommandQueue>,
+    scan_interval: Duration,
+}
+
+impl OfflineQueueProcessor {
+    pub fn new(data_dir: &Path, ingest_queue: Arc<CommandQueue>) -> Self {
+        Self {
+            db_path: data_dir.join("offline.db"),
+            ingest_queue,
+            scan_interval: Duration::from_secs(30),
+        }
+    }
+
+    /// Start background processing task
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run().await;
+        })
+    }
+
+    async fn run(&self) {
+        // Process on startup
+        self.process_queue().await;
+
+        // Then periodically
+        let mut interval = tokio::time::interval(self.scan_interval);
+        loop {
+            interval.tick().await;
+            self.process_queue().await;
+        }
+    }
+
+    async fn process_queue(&self) {
+        if !self.db_path.exists() {
+            return;
+        }
+
+        let conn = match Connection::open(&self.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to open offline queue: {}", e);
+                return;
+            }
+        };
+
+        // Get queued commands in order
+        let entries: Vec<(i64, String, String, i64)> = {
+            let mut stmt = match conn.prepare(
+                "SELECT id, request_type, request_json, original_timestamp
+                 FROM offline_queue ORDER BY queued_at LIMIT 100"
+            ) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            match stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => return,
+            }
+        };
+
+        for (id, request_type, json, timestamp) in entries {
+            // Parse and enqueue to ingest pipeline
+            match self.replay_entry(&request_type, &json, timestamp).await {
+                Ok(()) => {
+                    // Successfully queued - delete from offline db
+                    let _ = conn.execute(
+                        "DELETE FROM offline_queue WHERE id = ?1",
+                        params![id]
+                    );
+                    tracing::debug!("Replayed offline entry {}", id);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to replay entry {}: {}", id, e);
+                    // Don't delete - will retry next scan
+                    break;  // Stop on first failure to maintain order
+                }
+            }
+        }
+    }
+
+    async fn replay_entry(
+        &self,
+        request_type: &str,
+        json: &str,
+        timestamp: i64
+    ) -> Result<(), Error> {
+        // Parse JSON and create PendingCommand
+        let cmd = parse_offline_request(request_type, json, timestamp)?;
+
+        // Enqueue to normal ingest pipeline
+        self.ingest_queue.push(cmd)
+            .map_err(|_| Error::QueueFull)?;
+
+        Ok(())
+    }
+}
+
+/// Called when a new shell connects - triggers immediate queue scan
+pub fn on_shell_connect(processor: &OfflineQueueProcessor) {
+    // Notify processor to scan immediately
+    processor.trigger_scan();
+}
+```
+
 **Replay behavior:**
 - Commands replayed in original order (by `queued_at`)
 - Original timestamps preserved (for correct history ordering)
-- Partial replay safe (stops on first failure, resumes later)
-- Background replay doesn't block shell
+- Daemon scans on startup, shell connect, and every 30 seconds
+- Rate limited to 100 entries per scan cycle
+- Partial replay safe (stops on first failure, resumes next scan)
 
 ---
 
@@ -2163,44 +2784,230 @@ Signal received
 
 ```rust
 // daemon/shutdown.rs
-pub struct GracefulShutdown {
-    shutdown_rx: broadcast::Receiver<()>,
-    drain_timeout: Duration,
+
+/// Coordinates graceful shutdown across all daemon components
+pub struct ShutdownCoordinator {
+    /// Broadcast channel to notify all tasks
+    notify_tx: broadcast::Sender<ShutdownPhase>,
+    /// Tracks which components have completed shutdown
+    completion: Arc<ShutdownCompletion>,
+    /// Configuration
+    config: ShutdownConfig,
 }
 
-impl GracefulShutdown {
-    pub async fn run(
+#[derive(Clone, Copy, Debug)]
+pub enum ShutdownPhase {
+    /// Stop accepting new connections
+    StopAccepting,
+    /// Drain pending work
+    DrainQueues,
+    /// Flush to disk
+    FlushStorage,
+    /// Sync with peers (best effort)
+    SyncPeers,
+    /// Final cleanup
+    Terminate,
+}
+
+#[derive(Debug)]
+pub struct ShutdownConfig {
+    /// Total shutdown timeout
+    pub total_timeout: Duration,
+    /// Time to drain queues
+    pub drain_timeout: Duration,
+    /// Time to flush storage
+    pub flush_timeout: Duration,
+    /// Time for peer sync (best effort)
+    pub sync_timeout: Duration,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            total_timeout: Duration::from_secs(10),
+            drain_timeout: Duration::from_millis(500),
+            flush_timeout: Duration::from_secs(2),
+            sync_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Tracks completion of each component
+struct ShutdownCompletion {
+    socket_listener: AtomicBool,
+    writer_thread: AtomicBool,
+    offline_processor: AtomicBool,
+    peer_sync: AtomicBool,
+    index_writer: AtomicBool,
+}
+
+impl ShutdownCoordinator {
+    pub fn new(config: ShutdownConfig) -> (Self, broadcast::Receiver<ShutdownPhase>) {
+        let (notify_tx, notify_rx) = broadcast::channel(16);
+        let coordinator = Self {
+            notify_tx,
+            completion: Arc::new(ShutdownCompletion {
+                socket_listener: AtomicBool::new(false),
+                writer_thread: AtomicBool::new(false),
+                offline_processor: AtomicBool::new(false),
+                peer_sync: AtomicBool::new(false),
+                index_writer: AtomicBool::new(false),
+            }),
+            config,
+        };
+        (coordinator, notify_rx)
+    }
+
+    /// Get a shutdown handle for a component
+    pub fn handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            receiver: self.notify_tx.subscribe(),
+        }
+    }
+
+    /// Execute coordinated shutdown
+    pub async fn shutdown(
         &self,
         queue: Arc<CommandQueue>,
-        writer: &mut WriterThread,
-        sync: Option<&PeerSync>,
-    ) -> Result<(), Error> {
-        // 1. Drain queue with timeout
-        let drain_result = tokio::time::timeout(
-            Duration::from_millis(500),
-            Self::drain_queue(&queue, writer)
+        writer_health: Arc<WriterHealth>,
+        sync: Option<Arc<PeerSync>>,
+    ) -> ShutdownReport {
+        let start = Instant::now();
+        let mut report = ShutdownReport::default();
+
+        tracing::info!("Starting graceful shutdown...");
+
+        // Phase 1: Stop accepting new connections
+        let _ = self.notify_tx.send(ShutdownPhase::StopAccepting);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tracing::debug!("Phase 1: Stopped accepting connections");
+
+        // Phase 2: Drain queues
+        let _ = self.notify_tx.send(ShutdownPhase::DrainQueues);
+        let drain_start = Instant::now();
+        let initial_pending = queue.pending_count.load(Ordering::Relaxed);
+
+        loop {
+            let pending = queue.pending_count.load(Ordering::Relaxed);
+            if pending == 0 {
+                report.commands_drained = initial_pending;
+                break;
+            }
+            if drain_start.elapsed() > self.config.drain_timeout {
+                report.commands_lost = pending;
+                tracing::warn!("Queue drain timeout, {} commands lost", pending);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tracing::debug!("Phase 2: Drained {} commands", report.commands_drained);
+
+        // Phase 3: Flush storage
+        let _ = self.notify_tx.send(ShutdownPhase::FlushStorage);
+        let flush_result = tokio::time::timeout(
+            self.config.flush_timeout,
+            Self::wait_for_writer_idle(&writer_health)
         ).await;
 
-        if drain_result.is_err() {
-            tracing::warn!(
-                "Queue drain timed out, {} commands may be lost",
-                queue.pending_count.load(Ordering::Relaxed)
-            );
+        report.storage_flushed = flush_result.is_ok();
+        if !report.storage_flushed {
+            tracing::warn!("Storage flush timeout");
         }
+        tracing::debug!("Phase 3: Storage flush complete");
 
-        // 2. Final SQLite flush
-        writer.flush_final()?;
-
-        // 3. Best-effort sync (don't block shutdown)
-        if let Some(sync) = sync {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
+        // Phase 4: Sync with peers (best effort)
+        if let Some(ref sync) = sync {
+            let _ = self.notify_tx.send(ShutdownPhase::SyncPeers);
+            let sync_result = tokio::time::timeout(
+                self.config.sync_timeout,
                 sync.push_pending()
             ).await;
+            report.peers_synced = sync_result.is_ok();
+            tracing::debug!("Phase 4: Peer sync {:?}", if report.peers_synced { "complete" } else { "timeout" });
         }
 
-        Ok(())
+        // Phase 5: Final termination
+        let _ = self.notify_tx.send(ShutdownPhase::Terminate);
+
+        report.duration = start.elapsed();
+        tracing::info!("Shutdown complete in {:?}", report.duration);
+        report
     }
+
+    async fn wait_for_writer_idle(health: &WriterHealth) {
+        // Wait for writer to become idle (no more work)
+        for _ in 0..50 {
+            if health.is_healthy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+}
+
+/// Handle given to each component to receive shutdown notifications
+pub struct ShutdownHandle {
+    receiver: broadcast::Receiver<ShutdownPhase>,
+}
+
+impl ShutdownHandle {
+    /// Wait for a specific shutdown phase
+    pub async fn wait_for(&mut self, phase: ShutdownPhase) {
+        loop {
+            match self.receiver.recv().await {
+                Ok(p) if std::mem::discriminant(&p) == std::mem::discriminant(&phase) => return,
+                Ok(_) => continue,
+                Err(_) => return, // Channel closed
+            }
+        }
+    }
+
+    /// Check if shutdown has been initiated
+    pub fn is_shutting_down(&mut self) -> bool {
+        matches!(self.receiver.try_recv(), Ok(_))
+    }
+}
+
+/// Report of shutdown execution
+#[derive(Default, Debug)]
+pub struct ShutdownReport {
+    pub duration: Duration,
+    pub commands_drained: u64,
+    pub commands_lost: u64,
+    pub storage_flushed: bool,
+    pub peers_synced: bool,
+}
+
+impl ShutdownReport {
+    pub fn is_clean(&self) -> bool {
+        self.commands_lost == 0 && self.storage_flushed
+    }
+}
+
+/// Install signal handlers for graceful shutdown
+pub fn install_signal_handlers(coordinator: Arc<ShutdownCoordinator>) {
+    // SIGTERM handler
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+        ).expect("Failed to install SIGTERM handler");
+
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt()
+        ).expect("Failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, initiating shutdown");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, initiating shutdown");
+            }
+        }
+
+        // Trigger shutdown (actual execution happens in main)
+        coordinator.notify_tx.send(ShutdownPhase::StopAccepting).ok();
+    });
 }
 ```
 
@@ -2361,6 +3168,19 @@ Sync:   Bi-directional log exchange, CRDT merge on apply
 // sync/hlc.rs - Hybrid Logical Clock for causal ordering
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Maximum allowed clock skew (1 hour by default)
+/// Timestamps more than this far in the future are rejected
+const MAX_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
+
+/// Error type for HLC operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HlcError {
+    /// Remote timestamp is too far in the future
+    ClockSkewExceeded { remote_time: u64, local_time: u64, skew_ms: u64 },
+    /// Logical counter overflow (extremely unlikely)
+    LogicalOverflow,
+}
+
 /// Hybrid Logical Clock: combines wall clock with logical counter
 /// Provides causal ordering across distributed nodes
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2374,51 +3194,87 @@ pub struct HLC {
 }
 
 impl HLC {
-    /// Generate a new timestamp, ensuring it's greater than any seen
-    pub fn now(&self, node_id: NodeId) -> HLC {
-        let wall = SystemTime::now()
+    /// Create an initial HLC (at epoch)
+    pub fn new() -> Self {
+        Self {
+            wall_time: 0,
+            logical: 0,
+            node_id: NodeId::default(),
+        }
+    }
+
+    /// Get current wall clock time
+    fn current_wall_time() -> u64 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_millis() as u64
+    }
+
+    /// Generate a new timestamp, ensuring it's greater than any seen
+    pub fn now(&self, node_id: NodeId) -> Result<HLC, HlcError> {
+        let wall = Self::current_wall_time();
 
         let (new_wall, new_logical) = if wall > self.wall_time {
             (wall, 0)
         } else {
-            (self.wall_time, self.logical + 1)
+            // Check for logical counter overflow
+            let new_logical = self.logical.checked_add(1)
+                .ok_or(HlcError::LogicalOverflow)?;
+            (self.wall_time, new_logical)
         };
 
-        HLC {
+        Ok(HLC {
             wall_time: new_wall,
             logical: new_logical,
             node_id,
-        }
+        })
     }
 
     /// Update clock after receiving a remote timestamp
-    pub fn receive(&mut self, remote: &HLC, local_node: NodeId) -> HLC {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+    /// Returns error if remote clock is too far ahead (clock skew exceeded)
+    pub fn receive(&mut self, remote: &HLC, local_node: NodeId) -> Result<HLC, HlcError> {
+        let wall = Self::current_wall_time();
+
+        // Check for excessive clock skew
+        if remote.wall_time > wall + MAX_CLOCK_SKEW_MS {
+            return Err(HlcError::ClockSkewExceeded {
+                remote_time: remote.wall_time,
+                local_time: wall,
+                skew_ms: remote.wall_time - wall,
+            });
+        }
 
         let (new_wall, new_logical) = if wall > self.wall_time && wall > remote.wall_time {
             (wall, 0)
         } else if self.wall_time > remote.wall_time {
-            (self.wall_time, self.logical + 1)
+            let logical = self.logical.checked_add(1)
+                .ok_or(HlcError::LogicalOverflow)?;
+            (self.wall_time, logical)
         } else if remote.wall_time > self.wall_time {
-            (remote.wall_time, remote.logical + 1)
+            let logical = remote.logical.checked_add(1)
+                .ok_or(HlcError::LogicalOverflow)?;
+            (remote.wall_time, logical)
         } else {
-            (self.wall_time, self.logical.max(remote.logical) + 1)
+            let logical = self.logical.max(remote.logical).checked_add(1)
+                .ok_or(HlcError::LogicalOverflow)?;
+            (self.wall_time, logical)
         };
 
         self.wall_time = new_wall;
         self.logical = new_logical;
 
-        HLC {
+        Ok(HLC {
             wall_time: new_wall,
             logical: new_logical,
             node_id: local_node,
-        }
+        })
+    }
+
+    /// Check if this timestamp is within acceptable skew of current time
+    pub fn is_valid(&self) -> bool {
+        let wall = Self::current_wall_time();
+        self.wall_time <= wall + MAX_CLOCK_SKEW_MS
     }
 }
 ```
@@ -2688,6 +3544,210 @@ pub enum SyncMessage {
     Ack {
         vector_clock: HashMap<NodeId, u64>,
     },
+}
+
+/// Configuration for peer connection retry behavior
+#[derive(Clone, Debug)]
+pub struct RetryConfig {
+    /// Initial delay before first retry
+    pub initial_delay: Duration,
+    /// Maximum delay between retries
+    pub max_delay: Duration,
+    /// Multiplier for exponential backoff
+    pub backoff_multiplier: f64,
+    /// Maximum number of retry attempts (None = unlimited)
+    pub max_attempts: Option<u32>,
+    /// Jitter factor (0.0 - 1.0) to randomize delays
+    pub jitter: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+            max_attempts: Some(10),
+            jitter: 0.1,
+        }
+    }
+}
+
+/// State of a peer connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting { attempt: u32 },
+    Failed { last_error: &'static str },
+}
+
+/// Peer connection with automatic retry and health monitoring
+pub struct PeerConnection {
+    peer_id: NodeId,
+    addr: String,
+    transport: Option<NoiseStream>,
+    state: Arc<RwLock<ConnectionState>>,
+    retry_config: RetryConfig,
+    last_activity: Arc<AtomicU64>,
+    metrics: ConnectionMetrics,
+}
+
+#[derive(Default)]
+pub struct ConnectionMetrics {
+    pub messages_sent: AtomicU64,
+    pub messages_received: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+    pub reconnect_count: AtomicU32,
+    pub last_error: parking_lot::RwLock<Option<String>>,
+}
+
+impl PeerConnection {
+    pub fn new(peer_id: NodeId, addr: String, retry_config: RetryConfig) -> Self {
+        Self {
+            peer_id,
+            addr,
+            transport: None,
+            state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            retry_config,
+            last_activity: Arc::new(AtomicU64::new(0)),
+            metrics: ConnectionMetrics::default(),
+        }
+    }
+
+    /// Connect with automatic retry
+    pub async fn connect(&mut self) -> Result<(), Error> {
+        let mut attempt = 0;
+        let mut delay = self.retry_config.initial_delay;
+
+        loop {
+            *self.state.write() = if attempt == 0 {
+                ConnectionState::Connecting
+            } else {
+                ConnectionState::Reconnecting { attempt }
+            };
+
+            match self.try_connect().await {
+                Ok(()) => {
+                    *self.state.write() = ConnectionState::Connected;
+                    self.update_activity();
+                    tracing::info!("Connected to peer {} after {} attempts", self.peer_id, attempt + 1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempt += 1;
+                    *self.metrics.last_error.write() = Some(e.to_string());
+
+                    if let Some(max) = self.retry_config.max_attempts {
+                        if attempt >= max {
+                            *self.state.write() = ConnectionState::Failed {
+                                last_error: "max retries exceeded",
+                            };
+                            tracing::error!(
+                                "Failed to connect to peer {} after {} attempts: {}",
+                                self.peer_id, attempt, e
+                            );
+                            return Err(Error::ConnectionFailed);
+                        }
+                    }
+
+                    // Apply jitter to delay
+                    let jittered_delay = self.apply_jitter(delay);
+                    tracing::warn!(
+                        "Connection to peer {} failed (attempt {}), retrying in {:?}: {}",
+                        self.peer_id, attempt, jittered_delay, e
+                    );
+
+                    tokio::time::sleep(jittered_delay).await;
+
+                    // Exponential backoff
+                    delay = Duration::from_secs_f64(
+                        (delay.as_secs_f64() * self.retry_config.backoff_multiplier)
+                            .min(self.retry_config.max_delay.as_secs_f64())
+                    );
+                }
+            }
+        }
+    }
+
+    async fn try_connect(&mut self) -> Result<(), Error> {
+        // Establish TCP connection
+        let stream = TcpStream::connect(&self.addr).await?;
+
+        // Perform Noise handshake
+        let transport = NoiseHandshake::initiate(stream, &self.peer_id).await?;
+
+        self.transport = Some(transport);
+        Ok(())
+    }
+
+    fn apply_jitter(&self, delay: Duration) -> Duration {
+        let jitter_range = delay.as_secs_f64() * self.retry_config.jitter;
+        let jitter = rand::random::<f64>() * jitter_range * 2.0 - jitter_range;
+        Duration::from_secs_f64((delay.as_secs_f64() + jitter).max(0.0))
+    }
+
+    fn update_activity(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.last_activity.store(now, Ordering::Relaxed);
+    }
+
+    /// Send message with automatic reconnect on failure
+    pub async fn send(&mut self, msg: SyncMessage) -> Result<(), Error> {
+        // Try to send
+        match self.try_send(&msg).await {
+            Ok(()) => {
+                self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                self.update_activity();
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Send to peer {} failed, attempting reconnect: {}", self.peer_id, e);
+                self.metrics.reconnect_count.fetch_add(1, Ordering::Relaxed);
+
+                // Attempt reconnect and retry
+                self.connect().await?;
+                self.try_send(&msg).await?;
+                self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                self.update_activity();
+                Ok(())
+            }
+        }
+    }
+
+    async fn try_send(&mut self, msg: &SyncMessage) -> Result<(), Error> {
+        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
+        let bytes = bincode::serialize(msg)?;
+        self.metrics.bytes_sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        transport.send(&bytes).await?;
+        Ok(())
+    }
+
+    /// Receive message
+    pub async fn receive(&mut self) -> Result<SyncMessage, Error> {
+        let transport = self.transport.as_mut().ok_or(Error::NotConnected)?;
+        let bytes = transport.receive().await?;
+        self.metrics.bytes_received.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.metrics.messages_received.fetch_add(1, Ordering::Relaxed);
+        self.update_activity();
+        let msg = bincode::deserialize(&bytes)?;
+        Ok(msg)
+    }
+
+    /// Check if connection is healthy
+    pub fn is_healthy(&self) -> bool {
+        matches!(*self.state.read(), ConnectionState::Connected)
+    }
+
+    /// Get connection state
+    pub fn state(&self) -> ConnectionState {
+        *self.state.read()
+    }
 }
 
 /// Peer connection for sync
