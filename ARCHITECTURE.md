@@ -5828,79 +5828,107 @@ $ histdb sync enroll hdb_enroll_7f3a9b2c...
 ✓ Enrolled with home.example.com
 ```
 
-#### Duplicate Ephemeral Identity: Shared node_id Behavior
+#### Duplicate Ephemeral Identity: Merge as Single Node
 
 When multiple ephemeral machines (e.g., two Codespaces) share the same portable
-identity key and run simultaneously, the following semantics apply:
+identity key and run simultaneously, they are treated as a **single logical node**
+with their operations merged together.
 
-**Design Decision: Shared node_id (Portable Identity = Same Node)**
+**Design Decision: Option C - Merge as Single Node**
+
+All instances sharing a portable identity are merged into one unified node:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│           Portable Identity: Multiple Instances, One Peer Entry              │
+│           Option C: Merge as Single Node                                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │   HISTDB_IDENTITY (shared secret)                                            │
 │           │                                                                  │
 │           ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────┐                 │
-│   │                 node_id = hash(identity_key)          │                 │
-│   │                    (SAME for all instances)           │                 │
-│   └───────────────────────────────────────────────────────┘                 │
-│           │                             │                                    │
-│   ┌───────┴───────┐           ┌─────────┴─────────┐                         │
-│   │  Codespace A  │           │   Codespace B     │                         │
-│   │               │           │                   │                         │
-│   │ session_id=   │           │ session_id=       │   ← UUIDv7 (unique)     │
-│   │  01910a2b-... │           │  01910a2c-...     │                         │
-│   │               │           │                   │                         │
-│   │ Commands:     │           │ Commands:         │                         │
-│   │  history_id=  │           │  history_id=      │   ← UUIDv7 (unique)     │
-│   │   01910a2b-X  │           │   01910a2c-Y      │                         │
-│   └───────────────┘           └───────────────────┘                         │
+│   ┌───────────────────────────────────────────────────────────┐             │
+│   │           SINGLE LOGICAL NODE                              │             │
+│   │           node_id = hash(identity_key)                     │             │
+│   │                                                            │             │
+│   │   Operations from all instances merged into one stream:    │             │
+│   │   ┌─────────────────────────────────────────────────────┐ │             │
+│   │   │ seq=1: Insert(cmd_A)  ← from Codespace A            │ │             │
+│   │   │ seq=2: Insert(cmd_B)  ← from Codespace B            │ │             │
+│   │   │ seq=3: Update(cmd_A)  ← from Codespace A            │ │             │
+│   │   │ seq=4: Insert(cmd_C)  ← from Codespace B            │ │             │
+│   │   └─────────────────────────────────────────────────────┘ │             │
+│   └───────────────────────────────────────────────────────────┘             │
+│                     ▲                           ▲                            │
+│           ┌─────────┴─────────┐       ┌─────────┴─────────┐                 │
+│           │   Codespace A     │       │   Codespace B     │                 │
+│           │   session=01910a  │       │   session=01910b  │                 │
+│           │   (contributor)   │       │   (contributor)   │                 │
+│           └───────────────────┘       └───────────────────┘                 │
 │                                                                              │
+│   To static peers: appears as ONE peer with unified operation log           │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why This Is Correct:**
+**Merge Semantics:**
 
-| Aspect | Behavior | Why It Works |
-|--------|----------|--------------|
-| **Command uniqueness** | Each command has unique UUIDv7 `history_id` | No data loss, ever |
-| **Session tracking** | Each shell has unique UUIDv7 `session_id` | Sessions distinguishable |
-| **Peer management** | One peer entry covers all instances | Simple configuration |
-| **Sync operations** | All appear as "same peer" | Clean topology |
+| Aspect | Behavior |
+|--------|----------|
+| **node_id** | Same for all instances: `hash(identity_key)` |
+| **Operation log** | Unified - all instances contribute to same sequence |
+| **Sequence numbers** | Coordinated via HLC - no conflicts possible |
+| **To peers** | Appears as single node with one operation stream |
+| **Sessions** | Distinguishable via unique `session_id` (UUIDv7) |
+| **Commands** | Each has unique `history_id` (UUIDv7) - no duplicates |
 
-**Edge Case: Identical HLC Timestamps**
-
-If two instances write at exactly the same millisecond with the same logical
-counter (extremely rare), LWW tie-breaking uses `node_id`. Since `node_id` is
-shared, the tie-breaker is deterministic but arbitrary:
+**How Merge Works:**
 
 ```rust
-// Both Codespaces have same node_id (from shared identity)
-// If HLC is identical: same wall_time, same logical counter, same node_id
-// Result: deterministic (one wins consistently) but arbitrary (could be either)
+// When syncing to a static peer, all operations from all instances
+// with the same identity appear as coming from one node:
+
+// Codespace A writes: Insert(cmd_A) at HLC(100, 0, node_X)
+// Codespace B writes: Insert(cmd_B) at HLC(100, 1, node_X)  // Same node_id!
+// Codespace A writes: Update(cmd_A) at HLC(101, 0, node_X)
+
+// Static peer sees: single node "node_X" with operations:
+//   - Insert(cmd_A)
+//   - Insert(cmd_B)
+//   - Update(cmd_A)
+// All merged into one coherent stream, ordered by HLC
 ```
 
-**Why This Is Acceptable:**
+**Why Merge as Single Node Is Correct:**
 
-1. **Commands are never lost** - UUIDs guarantee uniqueness
-2. **Only affects exit_status** - Not the command itself
-3. **Probability is near-zero** - Same millisecond + same logical counter
-4. **User expectation** - "All my ephemeral machines are me" (one identity)
-5. **Simple configuration** - One peer entry, not N peer entries
+1. **User intent**: Portable identity means "all these machines are me"
+2. **Simple mental model**: One identity = one node in the sync topology
+3. **Clean peer management**: One peer entry covers all instances
+4. **No conflicts**: UUIDs ensure uniqueness, HLC ensures ordering
+5. **Unified history**: All commands from all instances in one stream
 
-**Alternative Considered (Rejected): Instance-Unique node_id**
+**Sequence Number Coordination:**
 
-We could derive `node_id = hash(identity_key + random_uuid)` for each instance,
-but this would:
-- Create multiple peer entries (confusing)
-- Complicate peer management
-- Go against user intent (portable identity = "same me")
+Instances don't need explicit coordination because:
+- HLC provides globally unique timestamps (wall_time + logical + node_id)
+- Operations are ordered by HLC, not by sequence number
+- Sequence numbers are local to each instance but merge correctly via HLC
 
-Users choose portable identity precisely because they want all their ephemeral
-machines to be treated as one identity. The current design respects that intent.
+```rust
+// Even if both instances use seq=1 locally, HLC disambiguates:
+// Codespace A: LogEntry { seq: 1, hlc: HLC(100, 0, node_X), ... }
+// Codespace B: LogEntry { seq: 1, hlc: HLC(100, 1, node_X), ... }
+//
+// After merge, ordered by HLC:
+// 1. HLC(100, 0, node_X) - from A
+// 2. HLC(100, 1, node_X) - from B (logical counter incremented)
+```
+
+**Alternatives Considered:**
+
+| Option | Description | Why Rejected |
+|--------|-------------|--------------|
+| **A: Instance-unique node_id** | Each instance gets unique node_id | Creates N peer entries, confusing |
+| **B: Shared node_id, separate logs** | Same node_id but independent logs | Inconsistent, complex merge |
+| **C: Merge as single node** | ✅ **Chosen** - unified operation log | Clean, matches user intent |
 
 ### Configuration (Complete)
 
