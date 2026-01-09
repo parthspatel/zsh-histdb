@@ -3250,13 +3250,31 @@ _histdb_get_hlc() {
 
 _histdb_queue_offline() {
     local request_type="$1" json="$2" hlc_json="$3"
-    _histdb_ensure_offline_db
-    # Use CLI helper for safe parameter binding (prevents SQL injection)
-    histdb-cli offline-queue \
-        --db "$HISTDB_OFFLINE_DB" \
-        --type "$request_type" \
-        --json "$json" \
-        --hlc "$hlc_json"
+
+    # Option B: Disk spill with atomic rename for durability
+    # Write to temp file first, then atomic rename to spool directory
+    # Daemon processes spool files later - more durable than direct SQLite
+    local spool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/histdb/spool"
+    [[ -d "$spool_dir" ]] || mkdir -p "$spool_dir"
+
+    # Generate unique filename: timestamp_nano_random.json
+    local timestamp=$(date +%s%N 2>/dev/null || date +%s)
+    local filename="${timestamp}_${RANDOM}.json"
+    local temp_file="${spool_dir}/.tmp_${filename}"
+    local final_file="${spool_dir}/${filename}"
+
+    # Write to temp file (crash-safe: either complete or not present)
+    {
+        print -r -- "{\"type\":\"${request_type}\","
+        print -r -- "\"payload\":${json},"
+        print -r -- "\"hlc\":${hlc_json},"
+        print -r -- "\"queued_at\":$(date +%s)}"
+    } > "$temp_file"
+
+    # Atomic rename - single syscall, crash-safe
+    # If crash happens before rename: temp file cleaned up on next boot
+    # If crash happens after rename: file is safely spooled
+    mv "$temp_file" "$final_file"
 }
 
 _histdb_send_or_queue() {
@@ -3374,29 +3392,50 @@ pub fn handle_hlc_now() {
 }
 ```
 
-**Daemon-driven replay:**
+**Daemon-driven replay (Disk Spool with Atomic Rename):**
 
 The daemon is responsible for processing offline queues, not the shell. This ensures:
 - Centralized control over replay timing and rate limiting
 - No shell startup latency from replay
 - Consistent handling across all shell types
 
+**Why Disk Spool Instead of SQLite:**
+- Simpler crash semantics: file either exists (complete) or doesn't
+- Atomic rename is a single syscall - no journal corruption risk
+- Faster for shells (no SQLite open/close overhead)
+- Easier to debug (just `ls` the spool directory)
+- More robust on systems with limited SQLite support
+
 ```rust
 // daemon/offline.rs
 
-/// Offline queue processor - runs as background task in daemon
-pub struct OfflineQueueProcessor {
-    db_path: PathBuf,
+/// Spool-based offline queue processor - processes JSON files from spool dir
+///
+/// Shell writes: temp file → atomic rename to spool dir
+/// Daemon reads: sorted by filename (timestamp-ordered) → delete after success
+pub struct SpoolQueueProcessor {
+    spool_dir: PathBuf,
     ingest_queue: Arc<CommandQueue>,
     scan_interval: Duration,
+    notify: Arc<Notify>,  // For immediate scan triggers
 }
 
-impl OfflineQueueProcessor {
+/// Spooled offline entry from shell
+#[derive(Deserialize)]
+struct SpoolEntry {
+    r#type: String,      // "start" or "finish"
+    payload: Value,      // Original request JSON
+    hlc: HlcJson,        // Preserved HLC timestamp
+    queued_at: i64,      // Unix timestamp when queued
+}
+
+impl SpoolQueueProcessor {
     pub fn new(data_dir: &Path, ingest_queue: Arc<CommandQueue>) -> Self {
         Self {
-            db_path: data_dir.join("offline.db"),
+            spool_dir: data_dir.join("spool"),
             ingest_queue,
             scan_interval: Duration::from_secs(30),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -3407,77 +3446,122 @@ impl OfflineQueueProcessor {
         })
     }
 
-    async fn run(&self) {
-        // Process on startup
-        self.process_queue().await;
+    /// Trigger immediate scan (called on shell connect)
+    pub fn trigger_scan(&self) {
+        self.notify.notify_one();
+    }
 
-        // Then periodically
-        let mut interval = tokio::time::interval(self.scan_interval);
+    async fn run(&self) {
+        // Clean up any leftover temp files from crashes
+        self.cleanup_temp_files();
+
+        // Process on startup
+        self.process_spool().await;
+
+        // Then periodically or on trigger
         loop {
-            interval.tick().await;
-            self.process_queue().await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.scan_interval) => {}
+                _ = self.notify.notified() => {}
+            }
+            self.process_spool().await;
         }
     }
 
-    async fn process_queue(&self) {
-        if !self.db_path.exists() {
+    /// Remove .tmp_* files left from incomplete writes
+    fn cleanup_temp_files(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.spool_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(".tmp_") {
+                        let _ = std::fs::remove_file(entry.path());
+                        tracing::debug!("Cleaned up temp file: {}", name);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_spool(&self) {
+        if !self.spool_dir.exists() {
             return;
         }
 
-        let conn = match Connection::open(&self.db_path) {
-            Ok(c) => c,
+        // List and sort spool files by name (timestamp-ordered)
+        let mut files: Vec<_> = match std::fs::read_dir(&self.spool_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.ends_with(".json") && !n.starts_with(".tmp_"))
+                        .unwrap_or(false)
+                })
+                .collect(),
             Err(e) => {
-                tracing::warn!("Failed to open offline queue: {}", e);
+                tracing::warn!("Failed to read spool dir: {}", e);
                 return;
             }
         };
 
-        // Get queued commands in order
-        let entries: Vec<(i64, String, String, i64)> = {
-            let mut stmt = match conn.prepare(
-                "SELECT id, request_type, request_json, original_timestamp
-                 FROM offline_queue ORDER BY queued_at LIMIT 100"
-            ) {
-                Ok(s) => s,
-                Err(_) => return,
+        // Sort by filename (timestamp prefix ensures chronological order)
+        files.sort_by_key(|e| e.file_name());
+
+        // Process up to 100 entries per scan
+        for entry in files.into_iter().take(100) {
+            let path = entry.path();
+            let filename = entry.file_name();
+
+            // Read and parse the spool file
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read spool file {:?}: {}", filename, e);
+                    continue;  // Skip corrupted files
+                }
             };
 
-            match stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => return,
-            }
-        };
+            let spool_entry: SpoolEntry = match serde_json::from_str(&content) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Failed to parse spool file {:?}: {}", filename, e);
+                    // Move corrupted file to .failed/ for debugging
+                    let failed_dir = self.spool_dir.join(".failed");
+                    let _ = std::fs::create_dir_all(&failed_dir);
+                    let _ = std::fs::rename(&path, failed_dir.join(filename));
+                    continue;
+                }
+            };
 
-        for (id, request_type, json, timestamp) in entries {
-            // Parse and enqueue to ingest pipeline
-            match self.replay_entry(&request_type, &json, timestamp).await {
+            // Replay to ingest queue
+            match self.replay_entry(&spool_entry).await {
                 Ok(()) => {
-                    // Successfully queued - delete from offline db
-                    let _ = conn.execute(
-                        "DELETE FROM offline_queue WHERE id = ?1",
-                        params![id]
-                    );
-                    tracing::debug!("Replayed offline entry {}", id);
+                    // Successfully queued - delete spool file
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!("Failed to delete spool file {:?}: {}", filename, e);
+                    } else {
+                        tracing::debug!("Replayed spool entry {:?}", filename);
+                    }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to replay entry {}: {}", id, e);
-                    // Don't delete - will retry next scan
+                    tracing::warn!("Failed to replay {:?}: {} (will retry)", filename, e);
+                    // Don't delete - will retry on next scan
                     break;  // Stop on first failure to maintain order
                 }
             }
         }
     }
 
-    async fn replay_entry(
-        &self,
-        request_type: &str,
-        json: &str,
-        timestamp: i64
-    ) -> Result<(), Error> {
-        // Parse JSON and create PendingCommand
-        let cmd = parse_offline_request(request_type, json, timestamp)?;
+    async fn replay_entry(&self, entry: &SpoolEntry) -> Result<(), Error> {
+        // Reconstruct HLC from stored values
+        let hlc = HLC {
+            wall_time: entry.hlc.wall_time,
+            logical: entry.hlc.logical,
+            node_id: entry.hlc.node_id.clone(),
+        };
+
+        // Parse and create PendingCommand with original HLC
+        let cmd = parse_offline_request(&entry.r#type, &entry.payload, hlc)?;
 
         // Enqueue to normal ingest pipeline
         self.ingest_queue.push(cmd)
@@ -3487,11 +3571,22 @@ impl OfflineQueueProcessor {
     }
 }
 
-/// Called when a new shell connects - triggers immediate queue scan
-pub fn on_shell_connect(processor: &OfflineQueueProcessor) {
-    // Notify processor to scan immediately
+/// Called when a new shell connects - triggers immediate spool scan
+pub fn on_shell_connect(processor: &SpoolQueueProcessor) {
     processor.trigger_scan();
 }
+```
+
+**Spool directory structure:**
+```
+~/.local/share/histdb/
+├── spool/
+│   ├── 1704067200000000000_12345.json   # Pending entries
+│   ├── 1704067200100000000_12346.json
+│   ├── .tmp_1704067200200000000_12347.json  # Incomplete (cleaned up)
+│   └── .failed/                         # Corrupted files for debugging
+│       └── malformed_entry.json
+└── history.db                           # Main database
 ```
 
 **Replay behavior:**
@@ -4225,8 +4320,62 @@ pub struct CrdtEntry {
     pub origin: NodeId,
     /// Entry state (G-Set semantics - once added, never removed from set)
     pub data: EntryData,
-    /// Tombstone for deletion (once set, wins over any update)
-    pub deleted: Option<HLC>,
+    /// Tombstone for deletion (type determines resurrection policy)
+    pub deleted: Option<Tombstone>,
+}
+
+/// Tombstone types with different resurrection semantics
+///
+/// Merge rules:
+/// - SecurityTombstone ALWAYS wins (privacy protection, irrecoverable)
+/// - GenericTombstone can be "resurrected" by a newer Insert/Update
+/// - Higher timestamp wins within same tombstone type
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TombstoneReason {
+    /// Normal deletion (e.g., cleanup, user preference)
+    /// Can be resurrected by newer operations
+    Generic,
+    /// Security/privacy deletion (e.g., sensitive command, credential leak)
+    /// ALWAYS wins - entry cannot be resurrected
+    Security,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub timestamp: HLC,
+    pub reason: TombstoneReason,
+}
+
+impl Tombstone {
+    pub fn generic(timestamp: HLC) -> Self {
+        Self { timestamp, reason: TombstoneReason::Generic }
+    }
+
+    pub fn security(timestamp: HLC) -> Self {
+        Self { timestamp, reason: TombstoneReason::Security }
+    }
+
+    /// Merge tombstones: Security always wins, otherwise newer timestamp wins
+    pub fn merge(&self, other: &Tombstone) -> Tombstone {
+        // Security tombstone always takes precedence (privacy protection)
+        match (&self.reason, &other.reason) {
+            (TombstoneReason::Security, _) => self.clone(),
+            (_, TombstoneReason::Security) => other.clone(),
+            // Both Generic: higher timestamp wins
+            _ => {
+                if other.timestamp > self.timestamp {
+                    other.clone()
+                } else {
+                    self.clone()
+                }
+            }
+        }
+    }
+
+    /// Check if this tombstone blocks resurrection
+    pub fn is_permanent(&self) -> bool {
+        self.reason == TombstoneReason::Security
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4364,8 +4513,14 @@ pub enum Operation {
         duration: LWWRegister<u64>,
     },
 
-    /// Delete entry (tombstone)
+    /// Delete entry (tombstone) - reason determines resurrection policy
     Delete {
+        entry_id: Uuid,
+        tombstone: Tombstone,
+    },
+
+    /// Resurrect entry (only works against GenericTombstone)
+    Resurrect {
         entry_id: Uuid,
         timestamp: HLC,
     },
@@ -4394,16 +4549,66 @@ impl Operation {
                 }
             }
 
-            Operation::Delete { entry_id, timestamp } => {
+            Operation::Delete { entry_id, tombstone } => {
                 if let Some(entry) = state.entries.get_mut(entry_id) {
-                    // Tombstone wins if timestamp is newer
+                    // Merge tombstones: Security always wins, otherwise newer timestamp
                     match &entry.deleted {
-                        Some(existing) if existing >= timestamp => {}
-                        _ => entry.deleted = Some(*timestamp),
+                        Some(existing) => {
+                            entry.deleted = Some(existing.merge(tombstone));
+                        }
+                        None => {
+                            entry.deleted = Some(tombstone.clone());
+                        }
+                    }
+                }
+            }
+
+            Operation::Resurrect { entry_id, timestamp } => {
+                if let Some(entry) = state.entries.get_mut(entry_id) {
+                    // Only resurrect if:
+                    // 1. Entry has a tombstone
+                    // 2. Tombstone is Generic (not Security)
+                    // 3. Resurrection timestamp is newer than tombstone
+                    if let Some(tombstone) = &entry.deleted {
+                        if !tombstone.is_permanent() && *timestamp > tombstone.timestamp {
+                            entry.deleted = None;
+                        }
+                        // Security tombstones cannot be resurrected - silently ignored
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    use super::*;
+
+    #[test]
+    fn test_security_tombstone_wins_over_generic() {
+        let generic = Tombstone::generic(HLC { wall_time: 200, logical: 0, node_id: "a".into() });
+        let security = Tombstone::security(HLC { wall_time: 100, logical: 0, node_id: "b".into() });
+
+        // Security wins even with older timestamp
+        let merged = generic.merge(&security);
+        assert_eq!(merged.reason, TombstoneReason::Security);
+    }
+
+    #[test]
+    fn test_generic_tombstone_newer_wins() {
+        let older = Tombstone::generic(HLC { wall_time: 100, logical: 0, node_id: "a".into() });
+        let newer = Tombstone::generic(HLC { wall_time: 200, logical: 0, node_id: "b".into() });
+
+        let merged = older.merge(&newer);
+        assert_eq!(merged.timestamp.wall_time, 200);
+    }
+
+    #[test]
+    fn test_resurrect_blocked_by_security_tombstone() {
+        let mut state = HistoryState::new();
+        // ... setup entry with security tombstone
+        // Resurrect operation should be silently ignored
     }
 }
 ```
@@ -4436,6 +4641,46 @@ pub struct LogEntry {
     pub operation: Operation,
     /// HLC timestamp
     pub timestamp: HLC,
+    /// CRC32 checksum for integrity validation (defense-in-depth)
+    /// Catches memory corruption, storage bitflips, and transmission errors
+    /// Computed over: seq || origin || operation_bytes || timestamp
+    pub checksum: u32,
+}
+
+impl LogEntry {
+    /// Compute CRC32 checksum over entry contents
+    /// Performance: < 1μs per operation (minimal overhead)
+    pub fn compute_checksum(&self) -> u32 {
+        use crc32fast::Hasher;
+        let mut hasher = Hasher::new();
+
+        // Hash all fields in deterministic order
+        hasher.update(&self.seq.to_le_bytes());
+        hasher.update(&self.origin.to_le_bytes());
+        hasher.update(&bincode::serialize(&self.operation).unwrap_or_default());
+        hasher.update(&self.timestamp.wall_time.to_le_bytes());
+        hasher.update(&self.timestamp.logical.to_le_bytes());
+        hasher.update(self.timestamp.node_id.as_bytes());
+
+        hasher.finalize()
+    }
+
+    /// Verify checksum matches computed value
+    pub fn verify_checksum(&self) -> bool {
+        self.checksum == self.compute_checksum()
+    }
+}
+
+/// Error when checksum validation fails
+#[derive(Debug, Error)]
+pub enum ChecksumError {
+    #[error("Checksum mismatch for entry seq={seq} origin={origin}: expected {expected}, got {actual}")]
+    Mismatch {
+        seq: u64,
+        origin: NodeId,
+        expected: u32,
+        actual: u32,
+    },
 }
 
 impl OperationLog {
@@ -4447,23 +4692,29 @@ impl OperationLog {
 
         let seq = self.next_seq()?;
 
-        let entry = LogEntry {
+        // Create entry without checksum first
+        let mut entry = LogEntry {
             seq,
             origin: self.node_id,
             operation: op,
             timestamp,
+            checksum: 0,  // Placeholder
         };
 
-        // Persist to local log
+        // Compute and set checksum (< 1μs overhead)
+        entry.checksum = entry.compute_checksum();
+
+        // Persist to local log with checksum
         self.conn.execute(
-            "INSERT INTO operation_log (seq, origin, timestamp_wall, timestamp_logical, operation)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO operation_log (seq, origin, timestamp_wall, timestamp_logical, operation, checksum)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 entry.seq,
                 entry.origin,
                 entry.timestamp.wall_time,
                 entry.timestamp.logical,
                 bincode::serialize(&entry.operation)?,
+                entry.checksum,
             ],
         )?;
 
@@ -4493,10 +4744,30 @@ impl OperationLog {
     }
 
     /// Apply entries from a remote peer
+    ///
+    /// Validates CRC32 checksums before applying - defense-in-depth against:
+    /// - Memory corruption during transmission
+    /// - Storage bitflips on remote peer
+    /// - Network corruption (additional layer beyond TLS)
     pub fn apply_remote(&self, entries: Vec<LogEntry>, state: &mut HistoryState) -> Result<(), Error> {
         let mut hlc = self.hlc.lock();
+        let mut corrupted_count = 0;
 
         for entry in entries {
+            // Verify checksum before applying (defense-in-depth)
+            if !entry.verify_checksum() {
+                let expected = entry.compute_checksum();
+                tracing::error!(
+                    "Checksum mismatch for entry seq={} origin={}: expected {}, got {}",
+                    entry.seq, entry.origin, expected, entry.checksum
+                );
+                corrupted_count += 1;
+
+                // Skip corrupted entries but continue processing
+                // (other entries may be valid)
+                continue;
+            }
+
             // Update HLC with remote timestamp
             *hlc = hlc.receive(&entry.timestamp, self.node_id);
 
@@ -4507,16 +4778,17 @@ impl OperationLog {
                 .unwrap_or(0);
 
             if entry.seq > existing_seq {
-                // Persist to local log
+                // Persist to local log with checksum
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO operation_log (seq, origin, timestamp_wall, timestamp_logical, operation)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR IGNORE INTO operation_log (seq, origin, timestamp_wall, timestamp_logical, operation, checksum)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         entry.seq,
                         entry.origin,
                         entry.timestamp.wall_time,
                         entry.timestamp.logical,
                         bincode::serialize(&entry.operation)?,
+                        entry.checksum,
                     ],
                 )?;
 
@@ -4528,7 +4800,56 @@ impl OperationLog {
             }
         }
 
+        if corrupted_count > 0 {
+            tracing::warn!("Skipped {} corrupted entries during sync", corrupted_count);
+        }
+
         Ok(())
+    }
+
+    /// Verify integrity of local log entries (for diagnostics)
+    pub fn verify_log_integrity(&self) -> Result<IntegrityReport, Error> {
+        let mut report = IntegrityReport::default();
+
+        let entries: Vec<LogEntry> = self.conn
+            .prepare("SELECT seq, origin, timestamp_wall, timestamp_logical, operation, checksum FROM operation_log")?
+            .query_map([], |row| {
+                // Deserialize entry
+                Ok(LogEntry {
+                    seq: row.get(0)?,
+                    origin: row.get(1)?,
+                    timestamp: HLC {
+                        wall_time: row.get(2)?,
+                        logical: row.get(3)?,
+                        node_id: String::new(),  // Not stored separately
+                    },
+                    operation: bincode::deserialize(&row.get::<_, Vec<u8>>(4)?).unwrap(),
+                    checksum: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for entry in entries {
+            report.total_entries += 1;
+            if !entry.verify_checksum() {
+                report.corrupted_entries.push((entry.seq, entry.origin));
+            }
+        }
+
+        Ok(report)
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct IntegrityReport {
+    pub total_entries: usize,
+    pub corrupted_entries: Vec<(u64, NodeId)>,
+}
+
+impl IntegrityReport {
+    pub fn is_healthy(&self) -> bool {
+        self.corrupted_entries.is_empty()
     }
 }
 ```
@@ -4934,6 +5255,131 @@ impl Daemon {
 
         Ok(())
     }
+
+    /// Delete/forget a command - user-initiated deletions use SecurityTombstone
+    ///
+    /// SecurityTombstone ensures the entry cannot be resurrected by sync from
+    /// other peers, protecting privacy even if other machines still have the entry.
+    pub async fn forget_command(&self, uuid: Uuid, security: bool) -> Result<(), Error> {
+        let timestamp = self.log.hlc.lock().now(self.node_id);
+
+        // User-initiated deletions default to Security (privacy protection)
+        // Only use Generic for programmatic/automatic cleanup
+        let tombstone = if security {
+            Tombstone::security(timestamp)
+        } else {
+            Tombstone::generic(timestamp)
+        };
+
+        let op = Operation::Delete {
+            entry_id: uuid,
+            tombstone,
+        };
+
+        let log_entry = self.log.append(op.clone())?;
+
+        // Apply locally
+        op.apply(&mut self.state.write());
+
+        // Broadcast tombstone to peers
+        let sync = self.sync.clone();
+        tokio::spawn(async move {
+            sync.broadcast(log_entry).await;
+        });
+
+        Ok(())
+    }
+
+    /// Resurrect a previously deleted entry (only works for GenericTombstone)
+    ///
+    /// Use case: Undo accidental deletion from auto-cleanup, restore from backup
+    /// SecurityTombstone entries cannot be resurrected (privacy protection)
+    pub async fn resurrect_command(&self, uuid: Uuid) -> Result<bool, Error> {
+        // Check if entry exists and has a non-security tombstone
+        let can_resurrect = {
+            let state = self.state.read();
+            if let Some(entry) = state.entries.get(&uuid) {
+                match &entry.deleted {
+                    Some(tombstone) => !tombstone.is_permanent(),
+                    None => false, // Not deleted, nothing to resurrect
+                }
+            } else {
+                false // Entry doesn't exist
+            }
+        };
+
+        if !can_resurrect {
+            return Ok(false);
+        }
+
+        let timestamp = self.log.hlc.lock().now(self.node_id);
+
+        let op = Operation::Resurrect {
+            entry_id: uuid,
+            timestamp,
+        };
+
+        let log_entry = self.log.append(op.clone())?;
+
+        // Apply locally
+        op.apply(&mut self.state.write());
+
+        // Broadcast
+        let sync = self.sync.clone();
+        tokio::spawn(async move {
+            sync.broadcast(log_entry).await;
+        });
+
+        Ok(true)
+    }
+}
+```
+
+### CLI Commands for Forget/Resurrect
+
+```rust
+// cli/forget.rs
+
+/// Forget (delete) a command from history
+///
+/// By default uses SecurityTombstone to ensure privacy protection.
+/// The --generic flag uses GenericTombstone which can be resurrected.
+pub fn handle_forget(
+    uuid: Uuid,
+    generic: bool,  // --generic flag for resurrectable deletion
+    service: &HistoryService,
+) -> Result<()> {
+    let security = !generic;
+
+    tokio::runtime::Runtime::new()?
+        .block_on(service.forget_command(uuid, security))?;
+
+    if security {
+        println!("Entry {} permanently deleted (SecurityTombstone)", uuid);
+        println!("This deletion will sync to all peers and cannot be undone.");
+    } else {
+        println!("Entry {} deleted (GenericTombstone)", uuid);
+        println!("This entry can be resurrected with: histdb resurrect {}", uuid);
+    }
+
+    Ok(())
+}
+
+/// Resurrect a previously deleted entry
+pub fn handle_resurrect(uuid: Uuid, service: &HistoryService) -> Result<()> {
+    let result = tokio::runtime::Runtime::new()?
+        .block_on(service.resurrect_command(uuid))?;
+
+    if result {
+        println!("Entry {} resurrected successfully", uuid);
+    } else {
+        println!("Cannot resurrect entry {}:", uuid);
+        println!("  - Entry may not exist");
+        println!("  - Entry may not be deleted");
+        println!("  - Entry may have a SecurityTombstone (cannot be resurrected)");
+    }
+
+    Ok(())
 }
 ```
 
@@ -4949,6 +5395,8 @@ ALTER TABLE history ADD COLUMN hlc_wall INTEGER;
 ALTER TABLE history ADD COLUMN hlc_logical INTEGER;
 ALTER TABLE history ADD COLUMN deleted_at_wall INTEGER;
 ALTER TABLE history ADD COLUMN deleted_at_logical INTEGER;
+-- Tombstone reason: 0 = Generic (can resurrect), 1 = Security (permanent)
+ALTER TABLE history ADD COLUMN tombstone_reason INTEGER DEFAULT NULL;
 
 -- Operation log (append-only, replicated)
 CREATE TABLE IF NOT EXISTS operation_log (
@@ -4957,6 +5405,8 @@ CREATE TABLE IF NOT EXISTS operation_log (
     timestamp_wall INTEGER NOT NULL,
     timestamp_logical INTEGER NOT NULL,
     operation BLOB NOT NULL,
+    -- CRC32 checksum for integrity validation (defense-in-depth)
+    checksum INTEGER NOT NULL,
     PRIMARY KEY (origin, seq)
 );
 
@@ -5378,6 +5828,80 @@ $ histdb sync enroll hdb_enroll_7f3a9b2c...
 ✓ Enrolled with home.example.com
 ```
 
+#### Duplicate Ephemeral Identity: Shared node_id Behavior
+
+When multiple ephemeral machines (e.g., two Codespaces) share the same portable
+identity key and run simultaneously, the following semantics apply:
+
+**Design Decision: Shared node_id (Portable Identity = Same Node)**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│           Portable Identity: Multiple Instances, One Peer Entry              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   HISTDB_IDENTITY (shared secret)                                            │
+│           │                                                                  │
+│           ▼                                                                  │
+│   ┌───────────────────────────────────────────────────────┐                 │
+│   │                 node_id = hash(identity_key)          │                 │
+│   │                    (SAME for all instances)           │                 │
+│   └───────────────────────────────────────────────────────┘                 │
+│           │                             │                                    │
+│   ┌───────┴───────┐           ┌─────────┴─────────┐                         │
+│   │  Codespace A  │           │   Codespace B     │                         │
+│   │               │           │                   │                         │
+│   │ session_id=   │           │ session_id=       │   ← UUIDv7 (unique)     │
+│   │  01910a2b-... │           │  01910a2c-...     │                         │
+│   │               │           │                   │                         │
+│   │ Commands:     │           │ Commands:         │                         │
+│   │  history_id=  │           │  history_id=      │   ← UUIDv7 (unique)     │
+│   │   01910a2b-X  │           │   01910a2c-Y      │                         │
+│   └───────────────┘           └───────────────────┘                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why This Is Correct:**
+
+| Aspect | Behavior | Why It Works |
+|--------|----------|--------------|
+| **Command uniqueness** | Each command has unique UUIDv7 `history_id` | No data loss, ever |
+| **Session tracking** | Each shell has unique UUIDv7 `session_id` | Sessions distinguishable |
+| **Peer management** | One peer entry covers all instances | Simple configuration |
+| **Sync operations** | All appear as "same peer" | Clean topology |
+
+**Edge Case: Identical HLC Timestamps**
+
+If two instances write at exactly the same millisecond with the same logical
+counter (extremely rare), LWW tie-breaking uses `node_id`. Since `node_id` is
+shared, the tie-breaker is deterministic but arbitrary:
+
+```rust
+// Both Codespaces have same node_id (from shared identity)
+// If HLC is identical: same wall_time, same logical counter, same node_id
+// Result: deterministic (one wins consistently) but arbitrary (could be either)
+```
+
+**Why This Is Acceptable:**
+
+1. **Commands are never lost** - UUIDs guarantee uniqueness
+2. **Only affects exit_status** - Not the command itself
+3. **Probability is near-zero** - Same millisecond + same logical counter
+4. **User expectation** - "All my ephemeral machines are me" (one identity)
+5. **Simple configuration** - One peer entry, not N peer entries
+
+**Alternative Considered (Rejected): Instance-Unique node_id**
+
+We could derive `node_id = hash(identity_key + random_uuid)` for each instance,
+but this would:
+- Create multiple peer entries (confusing)
+- Complicate peer management
+- Go against user intent (portable identity = "same me")
+
+Users choose portable identity precisely because they want all their ephemeral
+machines to be treated as one identity. The current design respects that intent.
+
 ### Configuration (Complete)
 
 ```toml
@@ -5462,7 +5986,7 @@ max_reconnect_delay = "30s"
 | **Concurrent writes** | Both succeed, merge via CRDT rules |
 | **Network partition** | Both sides continue writing, merge on reconnect |
 | **Exit status conflict** | Last-writer-wins (by HLC timestamp) |
-| **Delete vs update** | Delete tombstone wins |
+| **Delete vs update** | SecurityTombstone always wins; GenericTombstone can be resurrected |
 | **New node joins** | Catches up via anti-entropy sync |
 
 ### Convergence Properties
@@ -5935,10 +6459,10 @@ impl Pruner {
         // Prune in batches
         for batch in candidates.chunks(self.config.prune_batch_size) {
             for uuid in batch {
-                // Create tombstone (syncs to peers)
+                // Create GenericTombstone for automatic cleanup (can be resurrected)
                 let op = Operation::Delete {
                     entry_id: *uuid,
-                    timestamp: self.hlc.now(),
+                    tombstone: Tombstone::generic(self.hlc.now()),
                 };
                 self.log.append(op)?;
                 stats.pruned += 1;
@@ -6181,6 +6705,7 @@ parking_lot = "0.12"          # Fast mutexes (for non-hot paths only)
 
 # Hybrid sync (CRDT + log replication)
 bincode = "1.3"               # Efficient serialization for operation log
+crc32fast = "1.3"             # CRC32 checksums for operation log integrity
 
 # Sync security & networking
 snow = "0.9"                  # Noise Protocol Framework
