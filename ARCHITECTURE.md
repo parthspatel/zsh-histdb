@@ -195,9 +195,9 @@ use uuid::Uuid;
 
 /// Type aliases for UUID-based identifiers
 /// All IDs use UUIDv7 for global uniqueness and time-ordering
-pub type SessionId = Uuid;
-pub type HistoryId = Uuid;
-pub type EntryId = Uuid;
+/// Note: SessionId and HistoryId are the only ID types - both shell-generated
+pub type SessionId = Uuid;  // Shell session (generated on shell startup)
+pub type HistoryId = Uuid;  // Individual command entry (generated per command)
 
 /// Lock-free bounded queue for incoming commands
 /// - Wait-free push (returns error if full, never blocks)
@@ -617,15 +617,42 @@ impl WriterThread {
         Ok(history_id)
     }
 
+    /// Update finish status - returns true if row was updated, false if not found
     fn update_finish(
         &self,
         tx: &Transaction,
         history_id: HistoryId,
         exit_status: i32,
         duration_ms: u64,
+    ) -> bool {
+        let rows_updated = tx.execute(
+            "UPDATE history SET exit_status = ?1, duration_ms = ?2 WHERE uuid = ?3",
+            params![exit_status, duration_ms, history_id.to_string()],
+        ).unwrap_or(0);
+
+        rows_updated > 0
+    }
+
+    /// Create placeholder entry for orphaned FinishCommand
+    /// Allows reconstruction when StartCommand arrives via sync
+    fn insert_placeholder(
+        &self,
+        tx: &Transaction,
+        history_id: HistoryId,
+        exit_status: i32,
+        duration_ms: u64,
     ) -> Result<(), rusqlite::Error> {
-        // Update history entry with exit status and duration
-        // ... implementation
+        tx.execute(
+            "INSERT OR IGNORE INTO history (uuid, session_id, argv, dir, host, start_time, exit_status, duration_ms)
+             VALUES (?1, NULL, NULL, NULL, ?2, ?3, ?4, ?5)",
+            params![
+                history_id.to_string(),
+                self.host,
+                Utc::now().timestamp(),  // Approximate start time
+                exit_status,
+                duration_ms,
+            ],
+        )?;
         Ok(())
     }
 }
@@ -1218,12 +1245,12 @@ impl Default for IndexBounds {
 pub struct HistoryIndex {
     /// Recent commands (LRU, bounded size)
     recent: Vec<RecentEntry>,
-    /// Command → entry IDs (for dedup/lookup)
-    by_command: HashMap<Box<str>, Vec<EntryId>>,
-    /// Directory → entry IDs (for --in/--at queries)
-    by_dir: HashMap<Box<Path>, Vec<EntryId>>,
+    /// Command → history IDs (for dedup/lookup)
+    by_command: HashMap<Box<str>, Vec<HistoryId>>,
+    /// Directory → history IDs (for --in/--at queries)
+    by_dir: HashMap<Box<Path>, Vec<HistoryId>>,
     /// Last N entries per session (for isearch)
-    by_session: HashMap<SessionId, VecDeque<EntryId>>,  // SessionId is Uuid
+    by_session: HashMap<SessionId, VecDeque<HistoryId>>,
     /// Memory bounds configuration
     bounds: IndexBounds,
     /// Current estimated memory usage
@@ -1286,38 +1313,38 @@ impl HistoryIndex {
         }
     }
 
-    fn evict_older_than(&mut self, threshold: i64) {
+    fn evict_older_than(&mut self, threshold: DateTime<Utc>) {
         let to_remove: Vec<_> = self.recent.iter()
             .filter(|e| e.start_time < threshold)
-            .map(|e| e.id)
+            .map(|e| e.history_id)
             .collect();
 
-        for id in to_remove {
-            self.remove_entry(id);
+        for history_id in to_remove {
+            self.remove_entry(history_id);
         }
     }
 
     fn evict_oldest_entry(&mut self) {
         if let Some(oldest) = self.recent.iter().min_by_key(|e| e.start_time) {
-            let id = oldest.id;
-            self.remove_entry(id);
+            let history_id = oldest.history_id;
+            self.remove_entry(history_id);
         }
     }
 
-    fn remove_entry(&mut self, id: EntryId) {
-        if let Some(pos) = self.recent.iter().position(|e| e.id == id) {
+    fn remove_entry(&mut self, history_id: HistoryId) {
+        if let Some(pos) = self.recent.iter().position(|e| e.history_id == history_id) {
             let entry = self.recent.remove(pos);
             self.estimated_memory -= Self::entry_memory_size(&entry);
 
             // Clean up maps
             if let Some(ids) = self.by_command.get_mut(&entry.argv) {
-                ids.retain(|&eid| eid != id);
+                ids.retain(|&eid| eid != history_id);
             }
             if let Some(ids) = self.by_dir.get_mut(&entry.dir) {
-                ids.retain(|&eid| eid != id);
+                ids.retain(|&eid| eid != history_id);
             }
-            if let Some(ids) = self.by_session.get_mut(&entry.session) {
-                ids.retain(|&eid| eid != id);
+            if let Some(ids) = self.by_session.get_mut(&entry.session_id) {
+                ids.retain(|&eid| eid != history_id);
             }
         }
     }
@@ -1345,21 +1372,22 @@ pub struct IndexStats {
 
 #[derive(Clone)]
 pub struct RecentEntry {
-    pub id: EntryId,          // UUIDv7
-    pub session: SessionId,   // UUIDv7
+    pub history_id: HistoryId,   // UUIDv7 (shell-generated)
+    pub session_id: SessionId,   // UUIDv7 (shell-generated)
     pub argv: Box<str>,
     pub dir: Box<Path>,
     pub host: Box<str>,
-    pub start_time: i64,
+    pub start_time: DateTime<Utc>,
     pub exit_status: Option<i32>,
+    pub duration_ms: Option<u64>,
 }
 
 /// Operations that can be applied to the index
 pub enum IndexOp {
     Insert(RecentEntry),
-    UpdateExitStatus { id: EntryId, status: i32, duration: u64 },
-    Evict { before: i64 },  // Evict entries older than timestamp
-    EvictIfNeeded,          // Check bounds and evict as needed
+    UpdateExitStatus { history_id: HistoryId, exit_status: i32, duration_ms: u64 },
+    Evict { before: DateTime<Utc> },  // Evict entries older than timestamp
+    EvictIfNeeded,                     // Check bounds and evict as needed
 }
 
 impl Absorb<IndexOp> for HistoryIndex {
@@ -1397,9 +1425,10 @@ impl Absorb<IndexOp> for HistoryIndex {
                     self.evict_if_needed();
                 }
             }
-            IndexOp::UpdateExitStatus { id, status, .. } => {
-                if let Some(entry) = self.recent.iter_mut().find(|e| e.id == *id) {
-                    entry.exit_status = Some(*status);
+            IndexOp::UpdateExitStatus { history_id, exit_status, duration_ms } => {
+                if let Some(entry) = self.recent.iter_mut().find(|e| e.history_id == *history_id) {
+                    entry.exit_status = Some(*exit_status);
+                    entry.duration_ms = Some(*duration_ms);  // Issue 10: Store duration
                 }
             }
             IndexOp::Evict { before } => {
@@ -1411,9 +1440,9 @@ impl Absorb<IndexOp> for HistoryIndex {
         }
     }
 
-    fn absorb_second(&mut self, op: IndexOp, other: &Self) {
-        // Same logic, can optimize by copying from `other`
-        self.absorb_first(&mut { op }, other);
+    fn absorb_second(&mut self, mut op: IndexOp, other: &Self) {
+        // Issue 7: Fixed borrow pattern - take ownership and reborrow
+        self.absorb_first(&mut op, other);
     }
 }
 
@@ -1427,8 +1456,8 @@ impl IndexWriter {
         self.write.append(IndexOp::Insert(entry));
     }
 
-    pub fn update_exit_status(&mut self, id: EntryId, status: i32, duration: u64) {
-        self.write.append(IndexOp::UpdateExitStatus { id, status, duration });
+    pub fn update_exit_status(&mut self, history_id: HistoryId, exit_status: i32, duration_ms: u64) {
+        self.write.append(IndexOp::UpdateExitStatus { history_id, exit_status, duration_ms });
     }
 
     /// Publish pending changes to readers
@@ -1468,7 +1497,7 @@ impl IndexReader {
             .iter()
             .filter(|(d, _)| d.starts_with(dir))
             .flat_map(|(_, ids)| ids.iter())
-            .filter_map(|id| guard.recent.iter().find(|e| e.id == *id))
+            .filter_map(|history_id| guard.recent.iter().find(|e| e.history_id == *history_id))
             .take(limit)
             .cloned()
             .collect()
@@ -1518,7 +1547,7 @@ impl IndexReader {
                 }
                 // Apply exclude_ids filter
                 if let Some(ref exclude) = builder.exclude_ids {
-                    if exclude.contains(&e.id) { return false; }
+                    if exclude.contains(&e.history_id) { return false; }
                 }
                 true
             })
@@ -1559,11 +1588,23 @@ impl WriterThread {
                     }
                 }
                 CommandKind::Finish { history_id, exit_status, duration_ms } => {
-                    self.update_finish(&tx, history_id, exit_status, duration_ms);
+                    // Issue 6: Handle orphaned FinishCommand (no matching StartCommand)
+                    // This can happen if:
+                    // - StartCommand was lost (crash, network issue)
+                    // - Sync brought FinishCommand before StartCommand
+                    let updated = self.update_finish(&tx, history_id, exit_status, duration_ms);
+
+                    if !updated {
+                        // Create placeholder entry with argv=NULL
+                        // Allows reconstruction from sync later
+                        tracing::warn!("Orphaned FinishCommand for {}, creating placeholder", history_id);
+                        self.insert_placeholder(&tx, history_id, exit_status, duration_ms)?;
+                    }
+
                     index_ops.push(IndexOp::UpdateExitStatus {
-                        id: history_id,
-                        status: exit_status,
-                        duration: duration_ms,
+                        history_id,
+                        exit_status,
+                        duration_ms,
                     });
                 }
             }
@@ -1660,7 +1701,7 @@ impl QueryExecutor {
         let conn = self.pool.get()?;
 
         // Adjust DB query to exclude IDs already found in index
-        let exclude_ids: HashSet<_> = recent.iter().map(|e| e.id).collect();
+        let exclude_ids: HashSet<_> = recent.iter().map(|e| e.history_id).collect();
         let db_builder = builder.clone()
             .exclude_ids(exclude_ids)
             .limit(requested_limit.saturating_sub(recent.len()));
@@ -1830,19 +1871,21 @@ pub struct Command {
 }
 
 pub struct Place {
-    pub id: i64,
+    pub id: i64,           // Internal surrogate key (for joins)
     pub host: String,
     pub dir: PathBuf,
 }
 
+/// History entry - UUID is primary identifier for sync/offline
 pub struct HistoryEntry {
-    pub id: i64,
-    pub session: i64,
-    pub command_id: i64,
-    pub place_id: i64,
-    pub exit_status: Option<i32>,
+    pub history_id: HistoryId,        // Primary key (UUIDv7, shell-generated)
+    pub session_id: SessionId,        // UUIDv7 session
+    pub argv: String,                 // Command text (denormalized for simplicity)
+    pub dir: PathBuf,                 // Working directory
+    pub host: String,                 // Hostname
+    pub exit_status: Option<i32>,     // NULL while running
     pub start_time: DateTime<Utc>,
-    pub duration: Option<Duration>,
+    pub duration_ms: Option<u64>,     // NULL while running
 }
 ```
 
@@ -2164,14 +2207,16 @@ impl<'a> NewCommand<'a> {
 // record.rs
 pub struct Recorder<'a> {
     conn: &'a Connection,
-    session_id: i64,
+    session_id: SessionId,  // UUIDv7 - shell-generated
     host: &'a str,
 }
 
 impl<'a> Recorder<'a> {
     /// Record a new command execution (called on zshaddhistory)
+    /// history_id is shell-generated UUIDv7 for offline queue correlation
     pub fn start_command(
         &self,
+        history_id: HistoryId,  // Shell-generated
         argv: &str,
         dir: &Path,
     ) -> Result<HistoryId, Error>;
@@ -2179,8 +2224,9 @@ impl<'a> Recorder<'a> {
     /// Update with exit status (called on precmd)
     pub fn finish_command(
         &self,
-        id: HistoryId,
+        history_id: HistoryId,
         exit_status: i32,
+        duration_ms: u64,
     ) -> Result<(), Error>;
 }
 ```
