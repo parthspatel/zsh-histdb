@@ -602,14 +602,16 @@ impl WriterThread {
     fn insert_history_entry(
         &self,
         tx: &Transaction,
+        history_id: HistoryId,  // Shell-generated UUIDv7
         session_id: SessionId,
         argv: &str,
         dir: &Path,
         host: &str,
         start_time: i64,
     ) -> Result<HistoryId, rusqlite::Error> {
-        // Generate new UUIDv7 for history entry
-        let history_id = Uuid::now_v7();
+        // history_id is shell-generated (UUIDv7) for:
+        // 1. Offline queue correlation (shell tracks ID for FinishCommand)
+        // 2. Idempotent replay (same ID = same entry, no duplicates)
         // Uses prepared statements, parameterized queries
         // ... implementation stores history_id as TEXT in SQLite
         Ok(history_id)
@@ -2132,11 +2134,15 @@ impl<'a> Recorder<'a> {
 
 **Safety**: Uses a single transaction for the insert sequence:
 ```rust
-pub fn start_command(&self, argv: &str, dir: &Path) -> Result<HistoryId, Error> {
+/// Start command recording
+/// history_id is shell-generated (UUIDv7) for offline queue correlation
+pub fn start_command(&self, history_id: HistoryId, argv: &str, dir: &Path) -> Result<HistoryId, Error> {
     let tx = self.conn.transaction()?;
 
-    // Generate UUIDv7 for this history entry
-    let history_id = Uuid::now_v7();
+    // history_id comes from shell - enables:
+    // 1. Offline queue: shell tracks ID for later FinishCommand
+    // 2. Idempotent replay: INSERT OR IGNORE deduplicates by UUID
+    // 3. No round-trip: shell proceeds immediately after spawning command
 
     // All inserts in one transaction - no race conditions
     tx.execute(
@@ -3107,10 +3113,10 @@ add-zsh-hook precmd _histdb_precmd
 
 #### BASH Integration (`shell/bash/histdb.bash`)
 ```bash
-# histdb BASH integration
+# histdb BASH integration - UUID-based, offline-capable
 HISTDB_SOCKET="${HISTDB_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/histdb-$(id -u).sock}"
 HISTDB_SESSION=""
-HISTDB_LAST_ID=""
+HISTDB_LAST_HISTORY_ID=""  # Shell-generated UUIDv7
 HISTDB_LAST_CMD=""
 
 _histdb_send() {
@@ -3119,31 +3125,41 @@ _histdb_send() {
 
 _histdb_init() {
     [[ -n "$HISTDB_SESSION" ]] && return
-    local resp
-    resp=$(_histdb_send '{"type":"Register","shell":"Bash","pid":'"$$"'}')
-    HISTDB_SESSION=$(echo "$resp" | jq -r '.session_id // empty')
+    # Generate UUIDv7 for this shell session
+    HISTDB_SESSION=$(histdb-cli uuid)
 }
 
 _histdb_preexec() {
     _histdb_init
     local cmd="$1"
     [[ -z "$cmd" ]] && return
+
+    # Shell generates UUID for this command (for offline correlation)
+    HISTDB_LAST_HISTORY_ID=$(histdb-cli uuid)
+
     # Escape for JSON
     cmd="${cmd//\\/\\\\}"
     cmd="${cmd//\"/\\\"}"
     cmd="${cmd//$'\n'/\\n}"
-    local json='{"type":"StartCommand","argv":"'"$cmd"'",'
-    json+='"dir":"'"${PWD//\"/\\\"}"'","session_id":'"$HISTDB_SESSION"'}'
-    local resp
-    resp=$(_histdb_send "$json")
-    HISTDB_LAST_ID=$(echo "$resp" | jq -r '.id // empty')
+    local json='{"type":"StartCommand",'
+    json+='"history_id":"'"$HISTDB_LAST_HISTORY_ID"'",'
+    json+='"session_id":"'"$HISTDB_SESSION"'",'
+    json+='"argv":"'"$cmd"'",'
+    json+='"dir":"'"${PWD//\"/\\\"}"'"}'
+
+    _histdb_send_or_queue "$json" "start"
 }
 
 _histdb_precmd() {
     local status=$?
-    [[ -z "$HISTDB_LAST_ID" ]] && return
-    _histdb_send '{"type":"FinishCommand","id":'"$HISTDB_LAST_ID"',"exit_status":'"$status"'}' &
-    HISTDB_LAST_ID=""
+    [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
+
+    local json='{"type":"FinishCommand",'
+    json+='"history_id":"'"$HISTDB_LAST_HISTORY_ID"'",'
+    json+='"exit_status":'"$status"'}'
+
+    _histdb_send_or_queue "$json" "finish"
+    HISTDB_LAST_HISTORY_ID=""
 }
 
 # BASH doesn't have preexec, use DEBUG trap
@@ -3270,8 +3286,15 @@ commands are lost, even on crash.
 ```
 
 **Key Design Decisions:**
-1. **Shell generates all UUIDs**: The shell generates `history_id` (UUIDv7) before sending to daemon. This prevents UUID collision between offline and online paths.
+
+1. **Shell generates all UUIDs (canonical)**: The shell generates `history_id` (UUIDv7) before sending to daemon.
+   - **Offline correlation**: Shell tracks ID for later FinishCommand when daemon unavailable
+   - **Idempotent replay**: Same UUID = same entry, INSERT OR IGNORE deduplicates
+   - **No round-trip**: Shell proceeds immediately without waiting for daemon response
+   - **UUIDv7 safety**: Time-ordered, 122-bit random, collision-resistant enough for local generation
+
 2. **HLC stored in offline queue**: Preserves causal ordering when replaying. Without this, replayed commands would get "wrong" timestamps and break CRDT merge.
+
 3. **FinishCommand also queued**: Exit status is just as important as command start - queue both.
 
 **Shell implementation (ZSH example with disk spool):**
