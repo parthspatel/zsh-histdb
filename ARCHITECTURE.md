@@ -216,15 +216,16 @@ pub struct PendingCommand {
 
 pub enum CommandKind {
     Start {
+        history_id: HistoryId,  // UUIDv7 - shell-generated for correlation
         session_id: SessionId,  // UUIDv7 - globally unique, time-ordered
         argv: Box<str>,         // Owned, no lifetime issues
         dir: Box<Path>,
         host: Box<str>,
-        start_time: i64,
+        start_time: DateTime<Utc>,  // Standardized on DateTime<Utc>
         response_tx: Option<oneshot::Sender<HistoryId>>,
     },
     Finish {
-        history_id: HistoryId,  // UUIDv7 - correlates with Start response
+        history_id: HistoryId,  // UUIDv7 - correlates with Start
         exit_status: i32,
         duration_ms: u64,
     },
@@ -582,10 +583,10 @@ impl WriterThread {
 
         for cmd in batch.drain(..) {
             match cmd.kind {
-                CommandKind::Start { session_id, argv, dir, host, start_time, response_tx } => {
-                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time)?;
+                CommandKind::Start { history_id, session_id, argv, dir, host, start_time, response_tx } => {
+                    self.insert_history_entry(&tx, history_id, session_id, &argv, &dir, &host, start_time)?;
                     if let Some(tx) = response_tx {
-                        let _ = tx.send(id);  // Ignore if receiver dropped
+                        let _ = tx.send(history_id);  // Return shell-generated ID
                     }
                 }
                 CommandKind::Finish { history_id, exit_status, duration_ms } => {
@@ -607,14 +608,14 @@ impl WriterThread {
         argv: &str,
         dir: &Path,
         host: &str,
-        start_time: i64,
-    ) -> Result<HistoryId, rusqlite::Error> {
+        start_time: DateTime<Utc>,  // Standardized on DateTime<Utc>
+    ) -> Result<(), rusqlite::Error> {
         // history_id is shell-generated (UUIDv7) for:
         // 1. Offline queue correlation (shell tracks ID for FinishCommand)
         // 2. Idempotent replay (same ID = same entry, no duplicates)
         // Uses prepared statements, parameterized queries
-        // ... implementation stores history_id as TEXT in SQLite
-        Ok(history_id)
+        // Stores start_time.timestamp() as INTEGER in SQLite
+        Ok(())
     }
 
     /// Update finish status - returns true if row was updated, false if not found
@@ -674,37 +675,40 @@ pub struct ConnectionHandler {
 }
 
 impl ConnectionHandler {
-    /// Handle incoming StartCommand - returns immediately
-    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+    /// Handle incoming StartCommand - returns immediately (fire-and-forget)
+    pub async fn handle_start(&self, history_id: HistoryId, argv: String, dir: String) -> FireAndForgetAck {
         let cmd = PendingCommand {
             kind: CommandKind::Start {
+                history_id,  // Shell-generated
                 session_id: self.session_id,
                 argv: argv.into_boxed_str(),
                 dir: PathBuf::from(dir).into_boxed_path(),
                 host: self.host.clone(),
-                start_time: Utc::now().timestamp(),
+                start_time: Utc::now(),  // DateTime<Utc>
                 response_tx: None,  // Fire-and-forget: no response channel
             },
             timestamp: Instant::now(),
         };
 
         match self.queue.push(cmd) {
-            Ok(()) => Response::Accepted,
-            Err(_) => Response::QueueFull,  // Backpressure signal
+            Ok(()) => FireAndForgetAck::Accepted,
+            Err(_) => FireAndForgetAck::QueueFull,  // Backpressure signal
         }
     }
 
     /// Handle StartCommand with ID response (for finish correlation)
-    pub async fn handle_start_with_id(&self, argv: String, dir: String) -> Response {
+    /// This is a request-response pattern - shell waits for history_id confirmation
+    pub async fn handle_start_with_id(&self, history_id: HistoryId, argv: String, dir: String) -> Response {
         let (tx, rx) = oneshot::channel();
 
         let cmd = PendingCommand {
             kind: CommandKind::Start {
+                history_id,  // Shell-generated
                 session_id: self.session_id,
                 argv: argv.into_boxed_str(),
                 dir: PathBuf::from(dir).into_boxed_path(),
                 host: self.host.clone(),
-                start_time: Utc::now().timestamp(),
+                start_time: Utc::now(),  // DateTime<Utc>
                 response_tx: Some(tx),
             },
             timestamp: Instant::now(),
@@ -716,7 +720,7 @@ impl ConnectionHandler {
 
         // Wait for writer to process (typically < 10ms)
         match tokio::time::timeout(Duration::from_millis(100), rx).await {
-            Ok(Ok(id)) => Response::CommandStarted { id },  // id is HistoryId (Uuid)
+            Ok(Ok(id)) => Response::CommandStarted { history_id: id },
             _ => Response::Timeout,
         }
     }
@@ -771,16 +775,16 @@ impl CommandQueue {
 
 // daemon/handler.rs - Usage
 impl ConnectionHandler {
-    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+    pub async fn handle_start(&self, history_id: HistoryId, argv: String, dir: String) -> FireAndForgetAck {
         let cmd = PendingCommand { /* ... */ };
 
         // Retry up to 3 times with backoff (100μs, 200μs, 400μs)
         match self.queue.push_with_retry(cmd, 3) {
-            Ok(()) => Response::Accepted,
+            Ok(()) => FireAndForgetAck::Accepted,
             Err(_) => {
                 // Final fallback: metrics + error response
                 metrics::counter!("histdb.queue.drops").increment(1);
-                Response::QueueFull
+                FireAndForgetAck::QueueFull
             }
         }
     }
@@ -882,24 +886,24 @@ impl OverflowHandler {
 }
 
 impl ConnectionHandler {
-    pub async fn handle_start(&self, argv: String, dir: String) -> Response {
+    pub async fn handle_start(&self, history_id: HistoryId, argv: String, dir: String) -> FireAndForgetAck {
         let cmd = PendingCommand { /* ... */ };
 
         // Non-blocking push attempt
         match self.queue.try_push(cmd.clone()) {
-            Ok(()) => Response::Accepted,
+            Ok(()) => FireAndForgetAck::Accepted,
             Err(_) => {
                 // Queue full - hand off to async overflow handler
                 // Shell gets immediate response, daemon retries async
                 match self.overflow.overflow_tx.try_send(cmd) {
                     Ok(()) => {
                         metrics::counter!("histdb.queue.overflow").increment(1);
-                        Response::AcceptedOverflow  // Tell shell "we got it, processing async"
+                        FireAndForgetAck::AcceptedOverflow  // Tell shell "we got it, processing async"
                     }
                     Err(_) => {
                         // Even overflow is full - extreme backpressure
                         metrics::counter!("histdb.queue.overflow_full").increment(1);
-                        Response::QueueFull
+                        FireAndForgetAck::QueueFull
                     }
                 }
             }
@@ -1291,8 +1295,8 @@ impl HistoryIndex {
 
     /// Evict entries to stay within bounds
     pub fn evict_if_needed(&mut self) {
-        let now = chrono::Utc::now().timestamp();
-        let age_threshold = now - self.bounds.max_age_secs as i64;
+        let now = chrono::Utc::now();
+        let age_threshold = now - chrono::Duration::seconds(self.bounds.max_age_secs as i64);
 
         // Phase 1: Evict by age
         let before_count = self.recent.len();
@@ -1411,15 +1415,15 @@ impl Absorb<IndexOp> for HistoryIndex {
                 self.by_command
                     .entry(entry.argv.clone())
                     .or_default()
-                    .push(entry.id);
+                    .push(entry.history_id);
                 self.by_dir
                     .entry(entry.dir.clone())
                     .or_default()
-                    .push(entry.id);
+                    .push(entry.history_id);
 
                 // Enforce per-session limit (evict before adding)
                 let session_entries = self.by_session
-                    .entry(entry.session)
+                    .entry(entry.session_id)
                     .or_default();
                 if session_entries.len() >= self.bounds.max_per_session {
                     // Evict oldest from this session
@@ -1427,7 +1431,7 @@ impl Absorb<IndexOp> for HistoryIndex {
                         self.remove_entry(old_id);
                     }
                 }
-                session_entries.push_back(entry.id);
+                session_entries.push_back(entry.history_id);
 
                 self.recent.push(entry.clone());
             }
@@ -1512,7 +1516,7 @@ impl IndexReader {
     /// Get oldest timestamp in index (for hybrid query decisions)
     pub fn oldest_timestamp(&self) -> Option<DateTime<Utc>> {
         let guard = self.read();
-        guard.recent.front().map(|e| e.start_time)
+        guard.recent.first().map(|e| e.start_time)  // Vec uses first(), not front()
     }
 
     /// General search using QueryBuilder filters
@@ -1569,36 +1573,37 @@ impl IndexReader {
 ```rust
 // ingest/writer.rs - Updated
 impl WriterThread {
-    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) {
-        let tx = self.conn.transaction().unwrap();
+    fn flush_batch(&mut self, batch: &mut Vec<PendingCommand>) -> Result<(), Error> {
+        let tx = self.conn.transaction()?;
         let mut index_ops = Vec::with_capacity(batch.len());
 
         for cmd in batch.drain(..) {
             match cmd.kind {
-                CommandKind::Start { session_id, argv, dir, host, start_time, response_tx } => {
-                    let id = self.insert_history_entry(&tx, session_id, &argv, &dir, &host, start_time);
+                CommandKind::Start { history_id, session_id, argv, dir, host, start_time, response_tx } => {
+                    self.insert_history_entry(&tx, history_id, session_id, &argv, &dir, &host, start_time)?;
 
                     // Queue index update
                     index_ops.push(IndexOp::Insert(RecentEntry {
-                        id,
-                        session: session_id,
+                        history_id,
+                        session_id,
                         argv: argv.clone(),
                         dir: dir.clone(),
                         host: host.clone(),
-                        start_time,
+                        start_time,  // Already DateTime<Utc> from CommandKind
                         exit_status: None,
+                        duration_ms: None,
                     }));
 
                     if let Some(tx) = response_tx {
-                        let _ = tx.send(id);
+                        let _ = tx.send(history_id);
                     }
                 }
                 CommandKind::Finish { history_id, exit_status, duration_ms } => {
-                    // Issue 6: Handle orphaned FinishCommand (no matching StartCommand)
+                    // Handle orphaned FinishCommand (no matching StartCommand)
                     // This can happen if:
                     // - StartCommand was lost (crash, network issue)
                     // - Sync brought FinishCommand before StartCommand
-                    let updated = self.update_finish(&tx, history_id, exit_status, duration_ms);
+                    let updated = self.update_finish(&tx, history_id, exit_status, duration_ms)?;
 
                     if !updated {
                         // Create placeholder entry with argv=NULL
@@ -1607,6 +1612,10 @@ impl WriterThread {
                         self.insert_placeholder(&tx, history_id, exit_status, duration_ms)?;
                     }
 
+                    // Note: For orphaned FinishCommand, this update will be a no-op since
+                    // the entry isn't in the index. This is intentional - absorb_first
+                    // gracefully ignores updates for missing entries. When StartCommand
+                    // eventually arrives via sync, the index will be populated correctly.
                     index_ops.push(IndexOp::UpdateExitStatus {
                         history_id,
                         exit_status,
@@ -1616,13 +1625,20 @@ impl WriterThread {
             }
         }
 
-        tx.commit().unwrap();
+        // Commit transaction - propagate error instead of panicking
+        if let Err(e) = tx.commit() {
+            tracing::error!("Failed to commit batch: {}", e);
+            // Index ops not applied - data remains consistent
+            // Entries will be retried on next batch
+            return Err(e.into());
+        }
 
         // Apply index updates and publish to readers
         for op in index_ops {
             self.index_writer.append(op);
         }
         self.index_writer.publish();  // Readers now see new entries
+        Ok(())
     }
 }
 ```
@@ -3106,6 +3122,8 @@ pub enum FireAndForget {
 pub enum FireAndForgetAck {
     /// Request accepted and queued
     Accepted,
+    /// Queue full but accepted into overflow buffer (async processing)
+    AcceptedOverflow,
     /// Queue full, retry later (shell should queue offline)
     QueueFull,
 }
@@ -3168,6 +3186,17 @@ pub enum Response {
         code: ErrorCode,
         message: String,
     },
+
+    /// Command started successfully (for start-with-id request)
+    CommandStarted {
+        history_id: Uuid,
+    },
+
+    /// Queue full, client should retry or queue offline
+    QueueFull,
+
+    /// Request timed out waiting for processing
+    Timeout,
 }
 
 /// State of a command in the system
