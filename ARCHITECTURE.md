@@ -520,11 +520,13 @@ impl WriterThread {
         let conn = Connection::open(db_path)?;
 
         // Optimize for write throughput
+        // busy_timeout aligned with query timeout (50ms) to prevent latency spikes
+        // If locked longer, retry via queue rather than blocking
         conn.execute_batch("
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA wal_autocheckpoint = 1000;
-            PRAGMA busy_timeout = 5000;
+            PRAGMA busy_timeout = 50;
         ")?;
 
         let mut writer = WriterThread::new(queue, conn, health);
@@ -719,9 +721,23 @@ impl ConnectionHandler {
         }
 
         // Wait for writer to process (typically < 10ms)
+        // Distinguish timeout (transient, safe to retry) from channel error (fatal)
         match tokio::time::timeout(Duration::from_millis(100), rx).await {
             Ok(Ok(id)) => Response::CommandStarted { history_id: id },
-            _ => Response::Timeout,
+            Ok(Err(_)) => {
+                // Channel closed - writer thread crashed or shut down
+                // Shell should fall back to offline queue, not retry
+                tracing::error!("Writer channel closed unexpectedly");
+                Response::Error {
+                    code: ErrorCode::Internal,
+                    message: "Writer unavailable".into(),
+                }
+            }
+            Err(_) => {
+                // Timeout - writer is slow but may still process
+                // Shell can retry or queue offline
+                Response::Timeout
+            }
         }
     }
 }
@@ -1434,6 +1450,12 @@ impl Absorb<IndexOp> for HistoryIndex {
                 session_entries.push_back(entry.history_id);
 
                 self.recent.push(entry.clone());
+
+                // Post-insert safety check: if memory estimation drifted or entry was
+                // larger than expected, evict again to guarantee bounds are satisfied
+                if self.needs_eviction() {
+                    self.evict_if_needed();
+                }
             }
             IndexOp::UpdateExitStatus { history_id, exit_status, duration_ms } => {
                 if let Some(entry) = self.recent.iter_mut().find(|e| e.history_id == *history_id) {
@@ -1787,7 +1809,7 @@ impl QueryExecutor {
 
         // Add index results first (more recent)
         for entry in index_results {
-            if seen.insert(entry.id) {
+            if seen.insert(entry.history_id) {
                 merged.push(entry.into());
                 if merged.len() >= limit {
                     return merged;
@@ -1797,7 +1819,7 @@ impl QueryExecutor {
 
         // Add DB results (older entries, already filtered to exclude index IDs)
         for row in db_results {
-            if seen.insert(row.id) {
+            if seen.insert(row.history_id) {
                 merged.push(row);
                 if merged.len() >= limit {
                     return merged;
@@ -1823,7 +1845,7 @@ impl QueryBuilder {
         // - session filter (sessions are bounded in index)
         // - time range starting recently
         // - explicit recent flag
-        self.session.is_some() || self.recent_only
+        self.session_filter.is_some() || self.recent_only
     }
 }
 ```
@@ -2414,19 +2436,65 @@ pub struct DaemonConfig {
     pub queue_capacity: usize,
 }
 
+/// Duration configuration that accepts multiple formats
+/// Supports: "7d" (days), "24h" (hours), "3600s" (seconds), or bare number (seconds)
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigDuration(pub u64);  // Stored as seconds internally
+
+impl<'de> Deserialize<'de> for ConfigDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+
+        if let Some(days) = s.strip_suffix('d') {
+            let d: u64 = days.parse().map_err(D::Error::custom)?;
+            Ok(ConfigDuration(d * 86400))
+        } else if let Some(hours) = s.strip_suffix('h') {
+            let h: u64 = hours.parse().map_err(D::Error::custom)?;
+            Ok(ConfigDuration(h * 3600))
+        } else if let Some(secs) = s.strip_suffix('s') {
+            let s: u64 = secs.parse().map_err(D::Error::custom)?;
+            Ok(ConfigDuration(s))
+        } else {
+            // Bare number = seconds (backwards compatible)
+            let s: u64 = s.parse().map_err(D::Error::custom)?;
+            Ok(ConfigDuration(s))
+        }
+    }
+}
+
+impl ConfigDuration {
+    pub fn as_secs(&self) -> u64 { self.0 }
+    pub fn as_chrono(&self) -> chrono::Duration { chrono::Duration::seconds(self.0 as i64) }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct IndexConfig {
     /// Maximum entries in in-memory index (default: 1000)
     /// Queries beyond this limit fall back to SQLite (hybrid query)
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
-    /// Evict entries older than (days)
-    pub max_age_days: u32,
+    /// Evict entries older than (e.g., "7d", "168h", "604800s", or 604800)
+    #[serde(default = "default_max_age")]
+    pub max_age: ConfigDuration,
     /// Memory limit (bytes)
     pub memory_limit: usize,
 }
 
 fn default_max_entries() -> usize { 1000 }
+fn default_max_age() -> ConfigDuration { ConfigDuration(7 * 24 * 60 * 60) }  // 7 days
+
+impl From<&IndexConfig> for IndexBounds {
+    fn from(config: &IndexConfig) -> Self {
+        IndexBounds {
+            max_entries: config.max_entries,
+            max_memory_bytes: config.memory_limit,
+            max_age_secs: config.max_age.as_secs(),
+            max_per_session: 500,  // Could add to config if needed
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SearchConfig {
@@ -2613,7 +2681,7 @@ queue_capacity = 4096            # Lock-free queue size
 # Queries for entries beyond this fall back to SQLite (hybrid query)
 # Increase for faster queries over recent history, decrease to save memory
 max_entries = 1000
-max_age_days = 7                 # Evict older entries
+max_age = "7d"                   # Evict older entries (supports: "7d", "168h", "604800s", or 604800)
 memory_limit = 52428800          # 50MB
 
 [search]
@@ -3240,20 +3308,35 @@ _histdb_init() {
     HISTDB_SESSION=$(histdb-cli uuid)
 }
 
-# Use zsh/net/socket if available, fall back to socat
+# Fire-and-forget socket send with non-blocking poll
+# Protocol is fire-and-forget: daemon ACKs via exit code, not response body
+# Shell queues offline if socket unavailable or write fails
 if zmodload zsh/net/socket 2>/dev/null; then
     _histdb_send() {
         local fd
-        zsocket $HISTDB_SOCKET && fd=$REPLY
-        [[ -n $fd ]] || return 1
+        # Non-blocking connect with poll
+        zsocket $HISTDB_SOCKET && fd=$REPLY || return 1
+
+        # Use zselect for non-blocking write check (if available)
+        if zmodload zsh/zselect 2>/dev/null; then
+            # Poll for write-ready with 100ms timeout
+            local -a ready
+            zselect -t 10 -w $fd ready  # 10 = 100ms in centiseconds
+            if (( ${#ready} == 0 )); then
+                exec {fd}>&-
+                return 1  # Timeout - queue offline
+            fi
+        fi
+
+        # Fire-and-forget: send and close immediately
+        # Daemon sends minimal ACK but we don't wait for it
         print -u $fd -- "$1"
-        local response
-        read -u $fd response
         exec {fd}>&-
-        print -- "$response"
+        return 0
     }
 else
     _histdb_send() {
+        # socat with 1s timeout, fire-and-forget (no response expected)
         print -- "$1" | socat -t1 - UNIX-CONNECT:$HISTDB_SOCKET 2>/dev/null
     }
 fi
