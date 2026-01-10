@@ -1473,6 +1473,59 @@ impl IndexReader {
             .cloned()
             .collect()
     }
+
+    /// Get oldest timestamp in index (for hybrid query decisions)
+    pub fn oldest_timestamp(&self) -> Option<DateTime<Utc>> {
+        let guard = self.read();
+        guard.recent.front().map(|e| e.start_time)
+    }
+
+    /// General search using QueryBuilder filters
+    /// Used by hybrid query to apply same filters to in-memory index
+    pub fn search(&self, builder: &QueryBuilder) -> Vec<RecentEntry> {
+        let guard = self.read();
+        let limit = builder.limit.unwrap_or(100);
+
+        guard.recent
+            .iter()
+            .rev()  // Most recent first
+            .filter(|e| {
+                // Apply pattern filter
+                if let Some(ref pattern) = builder.pattern {
+                    if !e.argv.contains(pattern) {
+                        return false;
+                    }
+                }
+                // Apply directory filter
+                if let Some(ref dir_filter) = builder.dir_filter {
+                    match dir_filter {
+                        DirFilter::Exact(d) => if e.dir != *d { return false; }
+                        DirFilter::Prefix(d) => if !e.dir.starts_with(d) { return false; }
+                    }
+                }
+                // Apply session filter
+                if let Some(ref session) = builder.session_filter {
+                    if e.session_id != *session { return false; }
+                }
+                // Apply time range filter
+                if let Some(ref time_range) = builder.time_range {
+                    if let Some(start) = time_range.start {
+                        if e.start_time < start { return false; }
+                    }
+                    if let Some(end) = time_range.end {
+                        if e.start_time > end { return false; }
+                    }
+                }
+                // Apply exclude_ids filter
+                if let Some(ref exclude) = builder.exclude_ids {
+                    if exclude.contains(&e.id) { return false; }
+                }
+                true
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
 }
 ```
 
@@ -2182,6 +2235,8 @@ pub struct QueryBuilder {
     pattern: Option<String>,
     limit: Option<usize>,
     order: Order,
+    exclude_ids: Option<HashSet<HistoryId>>,  // For hybrid query deduplication
+    recent_only: bool,                         // Constrain to recent entries
 }
 
 impl QueryBuilder {
@@ -2189,13 +2244,19 @@ impl QueryBuilder {
     pub fn host(self, host: &str) -> Self;
     pub fn in_dir(self, dir: &Path) -> Self;      // dir and subdirs
     pub fn at_dir(self, dir: &Path) -> Self;      // exact dir
-    pub fn session(self, session: i64) -> Self;
+    pub fn session(self, session: SessionId) -> Self;
     pub fn from(self, from: DateTime<Utc>) -> Self;
     pub fn until(self, until: DateTime<Utc>) -> Self;
     pub fn pattern(self, pattern: &str) -> Self;  // LIKE pattern
     pub fn glob(self, glob: &str) -> Self;        // GLOB pattern (escaped!)
     pub fn limit(self, n: usize) -> Self;
     pub fn descending(self) -> Self;
+
+    /// Exclude specific IDs from results (for hybrid query deduplication)
+    /// Used to avoid returning entries already found in the in-memory index
+    pub fn exclude_ids(self, ids: HashSet<HistoryId>) -> Self {
+        Self { exclude_ids: Some(ids), ..self }
+    }
 
     /// Execute query with parameterized SQL (no injection possible)
     pub fn execute(&self, conn: &Connection) -> Result<Vec<HistoryRow>, Error>;
@@ -2950,28 +3011,55 @@ use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum Request {
-    /// Record command start
-    /// Shell generates history_id (UUIDv7) for offline queue correlation
+/// Protocol split into two categories:
+/// 1. Fire-and-Forget: shell sends, daemon ACKs, shell ignores response
+/// 2. Request-Response: shell sends, waits for daemon response
+
+// ============================================================================
+// FIRE-AND-FORGET MESSAGES (shell ignores response, but daemon sends ACK)
+// Used for: command recording (StartCommand, FinishCommand)
+// Properties: offline-queueable, idempotent, can be replayed
+// ============================================================================
+
+/// Fire-and-forget request - shell doesn't wait for response content
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FireAndForget {
+    /// Record command start (shell generates history_id)
     StartCommand {
-        /// Shell-generated UUID for this command (enables idempotent replay)
-        history_id: Uuid,
-        /// Shell session ID (UUIDv7, generated on shell startup)
-        session_id: Uuid,
-        /// Command line
+        history_id: Uuid,    // Shell-generated UUIDv7
+        session_id: Uuid,    // Shell session
         argv: String,
-        /// Working directory
         dir: String,
     },
 
     /// Record command completion
     FinishCommand {
-        /// Same history_id from StartCommand
-        history_id: Uuid,
-        /// Exit status code
+        history_id: Uuid,    // Same as StartCommand
         exit_status: i32,
     },
+}
 
+/// Minimal ACK for fire-and-forget (shell checks exit code, not content)
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FireAndForgetAck {
+    /// Request accepted and queued
+    Accepted,
+    /// Queue full, retry later (shell should queue offline)
+    QueueFull,
+}
+
+// ============================================================================
+// REQUEST-RESPONSE MESSAGES (shell waits for and uses response)
+// Used for: queries, status checks, admin commands
+// Properties: NOT offline-queueable, require daemon to be running
+// ============================================================================
+
+/// Request-response request - shell waits for and processes response
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Request {
     /// Query history
     Query {
         pattern: Option<String>,
@@ -2985,19 +3073,17 @@ pub enum Request {
         history_id: Uuid,
     },
 
+    /// Get current HLC (for offline queue)
+    GetHlc,
+
     /// Graceful shutdown (admin only)
     Shutdown,
 }
 
+/// Response to request-response messages
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Response {
-    /// Command start acknowledged
-    Accepted,
-
-    /// Command completion acknowledged
-    Finished,
-
     /// Query results
     QueryResults {
         entries: Vec<HistoryEntry>,
@@ -3008,6 +3094,13 @@ pub enum Response {
     Status {
         history_id: Uuid,
         state: CommandState,
+    },
+
+    /// Current HLC
+    Hlc {
+        wall_time: i64,
+        logical: u32,
+        node_id: NodeId,
     },
 
     /// Error response
@@ -3123,6 +3216,28 @@ _histdb_send() {
     echo "$1" | socat -t1 - UNIX-CONNECT:"$HISTDB_SOCKET" 2>/dev/null
 }
 
+# Send to daemon or queue offline with warning
+_histdb_send_or_queue() {
+    local json="$1" msg_type="$2"
+
+    # Try daemon first
+    if histdb-cli send "$json" 2>/dev/null; then
+        return 0
+    fi
+
+    # Daemon unavailable - queue offline AND warn user
+    histdb-cli queue "$msg_type" "$json"
+
+    # Warn user (stderr, yellow if terminal supports it)
+    if [[ -t 2 ]]; then
+        echo -e "\e[33mhistdb: daemon unavailable, command queued offline\e[0m" >&2
+    else
+        echo "histdb: daemon unavailable, command queued offline" >&2
+    fi
+
+    return 1
+}
+
 _histdb_init() {
     [[ -n "$HISTDB_SESSION" ]] && return
     # Generate UUIDv7 for this shell session
@@ -3177,58 +3292,97 @@ PROMPT_COMMAND="_histdb_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 
 #### Nushell Integration (`shell/nu/histdb.nu`)
 ```nu
-# histdb Nushell integration
+# histdb Nushell integration - UUID-based, offline-capable
+# Matches ZSH/BASH: shell generates all UUIDs, supports offline queue
 
 let-env HISTDB_SOCKET = ($env.HISTDB_SOCKET? | default $"($env.XDG_RUNTIME_DIR? | default '/tmp')/histdb-($env.USER).sock")
-mut histdb_session = null
-mut histdb_last_id = null
 
-def histdb-send [msg: string] {
-    echo $msg | socat -t1 - $"UNIX-CONNECT:($env.HISTDB_SOCKET)" | from json
-}
+# Shell-generated UUIDs (same as ZSH/BASH)
+mut histdb_session: string = (histdb-cli uuid)  # Generated once on shell start
+mut histdb_last_history_id: string = ""
+mut histdb_last_cmd: string = ""
 
-def histdb-init [] {
-    if $histdb_session == null {
-        let resp = (histdb-send $'{"type":"Register","shell":"Nu","pid":($nu.pid)}')
-        $histdb_session = $resp.session_id
+# Send to daemon or queue offline (uses histdb-cli for consistency)
+def histdb-send-or-queue [msg: string, msg_type: string] {
+    let result = (do { histdb-cli send $msg } | complete)
+    if $result.exit_code != 0 {
+        # Daemon unavailable - queue to disk spool via CLI
+        histdb-cli queue $msg_type $msg
+        print -e $"(ansi yellow)histdb: queued offline(ansi reset)"
     }
 }
 
-# Hook into command execution
+# Hook into command execution (pre_execution)
 $env.config.hooks.pre_execution = {||
-    histdb-init
+    # Finish previous command first (using LAST_EXIT_CODE from previous execution)
+    if ($histdb_last_history_id | is-not-empty) {
+        let finish_json = {
+            type: "FinishCommand"
+            history_id: $histdb_last_history_id
+            exit_status: ($env.LAST_EXIT_CODE? | default 0)
+        } | to json
+        histdb-send-or-queue $finish_json "finish"
+    }
+
+    # Now start the new command
     let cmd = (commandline)
-    if ($cmd | is-empty) { return }
-    let json = {
+    if ($cmd | is-empty) {
+        $histdb_last_history_id = ""
+        return
+    }
+
+    # Shell generates history_id (for offline correlation)
+    $histdb_last_history_id = (histdb-cli uuid)
+
+    let start_json = {
         type: "StartCommand"
+        history_id: $histdb_last_history_id
+        session_id: $histdb_session
         argv: $cmd
         dir: $env.PWD
-        session_id: $histdb_session
     } | to json
-    let resp = (histdb-send $json)
-    $histdb_last_id = $resp.id?
+
+    histdb-send-or-queue $start_json "start"
+    $histdb_last_cmd = $cmd
 }
 
-$env.config.hooks.env_change = {
-    PWD: {|before, after|
-        # Could track directory changes if needed
+# Handle shell exit - finish last command
+$env.config.hooks.pre_prompt = {||
+    # This runs before each prompt, after command completes
+    # We handle finish in pre_execution instead for proper exit code capture
+}
+
+# On shell exit, finish any pending command
+def histdb-cleanup [] {
+    if ($histdb_last_history_id | is-not-empty) {
+        let finish_json = {
+            type: "FinishCommand"
+            history_id: $histdb_last_history_id
+            exit_status: ($env.LAST_EXIT_CODE? | default 0)
+        } | to json
+        histdb-send-or-queue $finish_json "finish"
     }
 }
-
-# Note: Nushell doesn't expose exit status in hooks yet
-# This is a limitation we document
 ```
+
+**Nushell Exit Status Handling:**
+- Uses `$env.LAST_EXIT_CODE` captured at next command's pre_execution
+- Exit status is recorded one command behind (when next command starts)
+- Shell exit handler ensures final command is recorded
 
 #### Shell Feature Matrix
 
 | Feature | ZSH | BASH | Nushell |
 |---------|-----|------|---------|
 | Command recording | ✅ | ✅ | ✅ |
-| Exit status | ✅ | ✅ | ⚠️ Limited |
+| Exit status | ✅ | ✅ | ✅ (delayed*) |
 | Command duration | ✅ | ✅ | ✅ |
-| Native socket | ✅ (zsh/net/socket) | ❌ (socat) | ❌ (socat) |
+| Native socket | ✅ (zsh/net/socket) | ❌ (histdb-cli) | ❌ (histdb-cli) |
+| Offline queue | ✅ | ✅ | ✅ (via histdb-cli) |
 | Interactive search | ✅ (widget) | ✅ (fzf) | ✅ (menu) |
-| Async send | ✅ (&!) | ✅ (&) | ⚠️ |
+| Shell-generated UUIDs | ✅ | ✅ | ✅ |
+
+*Nushell exit status: captured at next command start via `$env.LAST_EXIT_CODE`
 
 #### Shell Offline Queue (Disk Spool)
 
@@ -3357,15 +3511,24 @@ _histdb_send_or_queue() {
     # Get HLC for this operation
     local hlc_json=$(_histdb_get_hlc)
 
-    # Try daemon first
-    local resp=$(_histdb_send "$json" 2>/dev/null)
-    if [[ -n "$resp" ]]; then
-        print -- "$resp"
-        return 0
+    # Try daemon first with timeout
+    local resp
+    if resp=$(_histdb_send "$json" 2>/dev/null); then
+        if [[ -n "$resp" ]]; then
+            return 0
+        fi
     fi
 
-    # Queue for later - daemon will replay with preserved HLC
+    # Daemon unavailable - queue offline AND warn user
     _histdb_queue_offline "$request_type" "$json" "$hlc_json"
+
+    # Warn user (stderr, yellow if supported)
+    if [[ -t 2 ]]; then
+        print -u2 "\e[33mhistdb: daemon unavailable, command queued offline\e[0m"
+    else
+        print -u2 "histdb: daemon unavailable, command queued offline"
+    fi
+
     return 1
 }
 
@@ -4388,11 +4551,36 @@ impl HLC {
             (self.wall_time, new_logical)
         };
 
+        // Update internal state
+        self.wall_time = new_wall;
+        self.logical = new_logical;
+
         Ok(HLC {
             wall_time: new_wall,
             logical: new_logical,
             node_id,
         })
+    }
+
+    /// Tick with automatic retry on LogicalOverflow
+    /// If logical counter overflows (2^32 ops in same ms), sleep 1ms and retry
+    /// This is a rare edge case but handles it gracefully
+    pub fn tick_with_retry(&mut self, node_id: NodeId) -> HLC {
+        loop {
+            match self.tick(node_id) {
+                Ok(hlc) => return hlc,
+                Err(HlcError::LogicalOverflow) => {
+                    // Rare: 2^32 ops in same millisecond
+                    // Sleep 1ms to advance wall clock, then retry
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    tracing::warn!("HLC logical counter overflow, waited 1ms");
+                }
+                Err(e) => {
+                    // Other errors (clock skew) - shouldn't happen in tick()
+                    panic!("Unexpected HLC error: {:?}", e);
+                }
+            }
+        }
     }
 
     /// Update clock after receiving a remote timestamp
@@ -4518,6 +4706,8 @@ impl Tombstone {
     }
 }
 
+/// Core history entry data (local storage)
+/// Does NOT contain CRDT metadata - that's stored separately and joined at sync time
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EntryData {
     /// Session ID (UUIDv7 - unique per shell session, time-ordered)
@@ -4533,6 +4723,45 @@ pub struct EntryData {
     /// LWW-Register: last-writer-wins for mutable fields
     pub exit_status: Option<LWWRegister<i32>>,
     pub duration: Option<LWWRegister<u64>>,
+}
+
+/// CRDT metadata for sync (separate from EntryData)
+/// Stored in same table but populated separately:
+/// - uuid, origin_node, hlc_* populated on first insert
+/// - deleted_at_*, tombstone_reason populated on delete
+/// Joined with EntryData when preparing sync messages
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CrdtMetadata {
+    /// Unique ID for this entry (UUIDv7 - from shell)
+    pub uuid: Uuid,
+    /// Node that created this entry
+    pub origin_node: NodeId,
+    /// HLC timestamp when created
+    pub hlc: HLC,
+    /// Tombstone (if deleted)
+    pub deleted: Option<Tombstone>,
+}
+
+impl CrdtMetadata {
+    /// Create metadata for a new local entry
+    pub fn new_local(uuid: Uuid, node_id: NodeId, hlc: HLC) -> Self {
+        Self { uuid, origin_node: node_id, hlc, deleted: None }
+    }
+
+    /// Check if entry is deleted (tombstoned)
+    pub fn is_deleted(&self) -> bool { self.deleted.is_some() }
+
+    /// Check if permanently deleted (SecurityTombstone - cannot resurrect)
+    pub fn is_permanently_deleted(&self) -> bool {
+        self.deleted.as_ref().map_or(false, |t| t.is_permanent())
+    }
+}
+
+/// Full entry for sync (combines EntryData + CrdtMetadata)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncEntry {
+    pub data: EntryData,
+    pub crdt: CrdtMetadata,
 }
 
 /// Last-Writer-Wins Register for mutable fields
@@ -5480,7 +5709,7 @@ impl Daemon {
 
     /// Update exit status - LWW semantics
     pub async fn finish_command(&self, uuid: Uuid, exit_status: i32, duration: u64) -> Result<(), Error> {
-        let timestamp = self.log.hlc.lock().now(self.node_id);
+        let timestamp = self.log.hlc.lock().tick(self.node_id)?;
 
         let op = Operation::UpdateStatus {
             entry_id: uuid,
@@ -5507,7 +5736,7 @@ impl Daemon {
     /// SecurityTombstone ensures the entry cannot be resurrected by sync from
     /// other peers, protecting privacy even if other machines still have the entry.
     pub async fn forget_command(&self, uuid: Uuid, security: bool) -> Result<(), Error> {
-        let timestamp = self.log.hlc.lock().now(self.node_id);
+        let timestamp = self.log.hlc.lock().tick(self.node_id)?;
 
         // User-initiated deletions default to Security (privacy protection)
         // Only use Generic for programmatic/automatic cleanup
@@ -5558,7 +5787,7 @@ impl Daemon {
             return Ok(false);
         }
 
-        let timestamp = self.log.hlc.lock().now(self.node_id);
+        let timestamp = self.log.hlc.lock().tick(self.node_id)?;
 
         let op = Operation::Resurrect {
             entry_id: uuid,
@@ -5625,6 +5854,233 @@ pub fn handle_resurrect(uuid: Uuid, service: &HistoryService) -> Result<()> {
         println!("  - Entry may have a SecurityTombstone (cannot be resurrected)");
     }
 
+    Ok(())
+}
+```
+
+### CLI Commands for Shell Integration
+
+The `histdb-cli` binary provides commands that all shells use for:
+- UUID generation (consistent UUIDv7 across shells)
+- Daemon communication (unified protocol)
+- Offline queue management (shared implementation)
+
+```rust
+// cli/main.rs
+
+#[derive(Parser)]
+#[command(name = "histdb-cli")]
+pub enum Command {
+    /// Generate a new UUIDv7 (for history_id, session_id)
+    Uuid,
+
+    /// Get current HLC from daemon (for offline queue)
+    HlcNow,
+
+    /// Send message to daemon (returns exit code 0 on success, 1 on failure)
+    Send {
+        /// JSON message to send
+        message: String,
+    },
+
+    /// Queue message offline (when daemon unavailable)
+    Queue {
+        /// Message type: "start" or "finish"
+        msg_type: String,
+        /// JSON message to queue
+        message: String,
+    },
+
+    /// Process offline queue (called by daemon on startup)
+    ProcessQueue,
+
+    // ... other commands (query, forget, resurrect, etc.)
+}
+
+/// Generate UUIDv7 - time-ordered, globally unique
+pub fn handle_uuid() {
+    println!("{}", Uuid::now_v7());
+}
+
+/// Get current HLC from daemon
+pub fn handle_hlc_now() -> Result<()> {
+    let socket_path = get_socket_path();
+    let mut stream = UnixStream::connect(&socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+    // Request HLC from daemon
+    let request = r#"{"type":"GetHlc"}"#;
+    writeln!(stream, "{}", request)?;
+
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+
+    // Output HLC as JSON for shell to parse
+    print!("{}", response.trim());
+    Ok(())
+}
+
+/// Send message to daemon - fire-and-forget with exit code
+pub fn handle_send(message: &str) -> Result<()> {
+    let socket_path = get_socket_path();
+
+    // Try to connect with short timeout
+    let stream = UnixStream::connect(&socket_path)
+        .map_err(|_| Error::DaemonUnavailable)?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+
+    let mut writer = BufWriter::new(&stream);
+    writeln!(writer, "{}", message)?;
+    writer.flush()?;
+
+    // Read response (fire-and-forget still gets ACK)
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+
+    // Check response indicates success
+    if response.contains("Accepted") || response.contains("ok") {
+        Ok(())
+    } else {
+        Err(Error::DaemonRejected(response))
+    }
+}
+
+/// Queue message to disk spool for later replay
+pub fn handle_queue(msg_type: &str, message: &str) -> Result<()> {
+    let spool_dir = get_spool_dir()?;
+    std::fs::create_dir_all(&spool_dir)?;
+
+    // Generate unique filename with timestamp for ordering
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_micros();
+    let uuid = Uuid::now_v7();
+    let filename = format!("{:016x}-{}.json", timestamp, uuid);
+
+    // Get cached HLC or create local one
+    let hlc = get_cached_hlc_or_local();
+
+    // Create spool entry
+    let entry = SpoolEntry {
+        msg_type: msg_type.to_string(),
+        payload: message.to_string(),
+        hlc,
+        queued_at: timestamp as i64,
+    };
+
+    // Atomic write: write to temp, then rename
+    let temp_path = spool_dir.join(format!(".tmp-{}", filename));
+    let final_path = spool_dir.join(&filename);
+
+    let mut file = File::create(&temp_path)?;
+    serde_json::to_writer(&mut file, &entry)?;
+    file.sync_all()?;  // Ensure durability
+
+    std::fs::rename(&temp_path, &final_path)?;
+
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct SpoolEntry {
+    msg_type: String,
+    payload: String,
+    hlc: HLC,
+    queued_at: i64,
+}
+
+fn get_socket_path() -> PathBuf {
+    std::env::var("HISTDB_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| "/tmp".to_string());
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("{}/histdb-{}.sock", runtime_dir, uid))
+        })
+}
+
+fn get_spool_dir() -> Result<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".local/share")
+        });
+    Ok(data_dir.join("histdb/spool"))
+}
+
+/// Get cached HLC or generate local one
+/// Maintains causal ordering even when offline by:
+/// 1. Caching last HLC received from daemon
+/// 2. Incrementing locally when daemon unavailable
+fn get_cached_hlc_or_local() -> HLC {
+    let cache_path = get_hlc_cache_path();
+
+    // Try to read cached HLC
+    if let Ok(cached) = read_cached_hlc(&cache_path) {
+        // Increment locally for this operation
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // HLC tick: if wall time advanced, reset logical; else increment logical
+        if now_ms > cached.wall_time {
+            return HLC {
+                wall_time: now_ms,
+                logical: 0,
+                node_id: cached.node_id,
+            };
+        } else {
+            // Same or earlier wall time - increment logical counter
+            let new_hlc = HLC {
+                wall_time: cached.wall_time,
+                logical: cached.logical.saturating_add(1),
+                node_id: cached.node_id,
+            };
+            // Update cache with new logical value
+            let _ = write_cached_hlc(&cache_path, &new_hlc);
+            return new_hlc;
+        }
+    }
+
+    // No cache - create local HLC (wall time only, no node_id yet)
+    // This will be corrected when daemon replays with proper HLC
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    HLC {
+        wall_time: now_ms,
+        logical: 0,
+        node_id: 0, // Will be set by daemon on replay
+    }
+}
+
+/// Cache HLC from daemon response (called after successful GetHlc)
+fn cache_hlc_from_daemon(hlc: &HLC) -> Result<()> {
+    let cache_path = get_hlc_cache_path();
+    write_cached_hlc(&cache_path, hlc)
+}
+
+fn get_hlc_cache_path() -> PathBuf {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("{}/histdb-{}-hlc.json", runtime_dir, uid))
+}
+
+fn read_cached_hlc(path: &Path) -> Result<HLC> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(Error::from)
+}
+
+fn write_cached_hlc(path: &Path, hlc: &HLC) -> Result<()> {
+    let content = serde_json::to_string(hlc)?;
+    std::fs::write(path, content)?;
     Ok(())
 }
 ```
@@ -6747,9 +7203,10 @@ impl Pruner {
         for batch in candidates.chunks(self.config.prune_batch_size) {
             for uuid in batch {
                 // Create GenericTombstone for automatic cleanup (can be resurrected)
+                let timestamp = self.hlc.lock().tick(self.node_id)?;
                 let op = Operation::Delete {
                     entry_id: *uuid,
-                    tombstone: Tombstone::generic(self.hlc.now()),
+                    tombstone: Tombstone::generic(timestamp),
                 };
                 self.log.append(op)?;
                 stats.pruned += 1;
