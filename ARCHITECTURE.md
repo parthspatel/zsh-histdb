@@ -642,13 +642,18 @@ impl WriterThread {
         exit_status: i32,
         duration_ms: u64,
     ) -> Result<(), rusqlite::Error> {
+        // Calculate start_time from duration: now - duration = approximate start
+        // This gives a more accurate estimate than just using now()
+        let now = Utc::now();
+        let start_time = now - chrono::Duration::milliseconds(duration_ms as i64);
+
         tx.execute(
             "INSERT OR IGNORE INTO history (uuid, session_id, argv, dir, host, start_time, exit_status, duration_ms)
              VALUES (?1, NULL, NULL, NULL, ?2, ?3, ?4, ?5)",
             params![
                 history_id.to_string(),
                 self.host,
-                Utc::now().timestamp(),  // Approximate start time
+                start_time.timestamp(),  // Calculated from: now - duration_ms
                 exit_status,
                 duration_ms,
             ],
@@ -1394,6 +1399,12 @@ impl Absorb<IndexOp> for HistoryIndex {
     fn absorb_first(&mut self, op: &mut IndexOp, _: &Self) {
         match op {
             IndexOp::Insert(entry) => {
+                // IMPORTANT: Evict BEFORE insert to ensure bounds are never exceeded
+                // This prevents temporary memory spikes and maintains strict bounds
+                if self.needs_eviction() {
+                    self.evict_if_needed();
+                }
+
                 // Track memory
                 self.estimated_memory += Self::entry_memory_size(entry);
 
@@ -1406,7 +1417,7 @@ impl Absorb<IndexOp> for HistoryIndex {
                     .or_default()
                     .push(entry.id);
 
-                // Enforce per-session limit
+                // Enforce per-session limit (evict before adding)
                 let session_entries = self.by_session
                     .entry(entry.session)
                     .or_default();
@@ -1419,11 +1430,6 @@ impl Absorb<IndexOp> for HistoryIndex {
                 session_entries.push_back(entry.id);
 
                 self.recent.push(entry.clone());
-
-                // Check bounds after insert
-                if self.needs_eviction() {
-                    self.evict_if_needed();
-                }
             }
             IndexOp::UpdateExitStatus { history_id, exit_status, duration_ms } => {
                 if let Some(entry) = self.recent.iter_mut().find(|e| e.history_id == *history_id) {
@@ -2240,8 +2246,9 @@ pub fn start_command(&self, history_id: HistoryId, argv: &str, dir: &Path) -> Re
 
     // history_id comes from shell - enables:
     // 1. Offline queue: shell tracks ID for later FinishCommand
-    // 2. Idempotent replay: INSERT OR IGNORE deduplicates by UUID
-    // 3. No round-trip: shell proceeds immediately after spawning command
+    // 2. Idempotent replay: ON CONFLICT deduplicates by UUID
+    // 3. Race handling: upsert fills placeholder if FinishCommand arrived first
+    // 4. No round-trip: shell proceeds immediately after spawning command
 
     // All inserts in one transaction - no race conditions
     tx.execute(
@@ -2254,13 +2261,20 @@ pub fn start_command(&self, history_id: HistoryId, argv: &str, dir: &Path) -> Re
         params![self.host, dir.display().to_string()],
     )?;
 
-    // INSERT OR IGNORE provides idempotent insert - UUID uniqueness acts as
-    // deduplication key for offline queue replay and sync operations
+    // INSERT ... ON CONFLICT provides idempotent upsert - handles both:
+    // 1. Normal case: insert new entry
+    // 2. Race case: FinishCommand arrived first and created placeholder
+    //    -> UPDATE fills in session_id, command_id, place_id, start_time
     tx.execute(
-        "INSERT OR IGNORE INTO history (uuid, session, command_id, place_id, start_time)
+        "INSERT INTO history (uuid, session, command_id, place_id, start_time)
          SELECT ?1, ?2, c.id, p.id, ?3
          FROM commands c, places p
-         WHERE c.argv = ?4 AND p.host = ?5 AND p.dir = ?6",
+         WHERE c.argv = ?4 AND p.host = ?5 AND p.dir = ?6
+         ON CONFLICT(uuid) DO UPDATE SET
+             session = COALESCE(excluded.session, session),
+             command_id = COALESCE(excluded.command_id, command_id),
+             place_id = COALESCE(excluded.place_id, place_id),
+             start_time = COALESCE(excluded.start_time, start_time)",
         params![history_id.to_string(), self.session_id.to_string(), Utc::now().timestamp(),
                 argv, self.host, dir.display().to_string()],
     )?;
@@ -3880,22 +3894,29 @@ pub fn on_shell_connect(processor: &SpoolQueueProcessor) {
 
 **Deduplication via UUID:**
 
-Replayed entries use `INSERT OR IGNORE` with the history UUID as the uniqueness key:
+Replayed entries use `INSERT ... ON CONFLICT DO UPDATE` with the history UUID as the uniqueness key:
 - Shell generates UUID before queueing (see shell integration)
 - Same UUID may be queued multiple times (retries, reconnects)
-- `INSERT OR IGNORE` silently skips duplicates (no error, no overwrite)
+- `ON CONFLICT DO UPDATE` fills in NULL fields from new data (handles placeholder race)
 - This makes replay **idempotent** - safe to replay same entry multiple times
 
 ```sql
 -- Deduplication constraint (from migration)
 ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
 
--- Idempotent insert (used by replay and sync)
-INSERT OR IGNORE INTO history (uuid, session, command_id, place_id, start_time)
+-- Idempotent upsert (used by replay and sync)
+-- Handles FinishCommand-before-StartCommand race condition
+INSERT INTO history (uuid, session, command_id, place_id, start_time)
 SELECT ?, ?, c.id, p.id, ?
 FROM commands c, places p
-WHERE c.argv = ? AND p.host = ? AND p.dir = ?;
--- Returns 0 rows changed if UUID already exists (duplicate silently ignored)
+WHERE c.argv = ? AND p.host = ? AND p.dir = ?
+ON CONFLICT(uuid) DO UPDATE SET
+    session = COALESCE(excluded.session, session),
+    command_id = COALESCE(excluded.command_id, command_id),
+    place_id = COALESCE(excluded.place_id, place_id),
+    start_time = COALESCE(excluded.start_time, start_time);
+-- New entry: inserts all fields
+-- Placeholder exists: fills in missing fields, preserves exit_status/duration
 ```
 
 **Why this matters:**
@@ -4345,21 +4366,44 @@ impl Daemon {
         // 3. Open SQLite (auto-recovers WAL)
         let conn = Connection::open(&self.db_path)?;
 
-        // 4. Rebuild left-right index from recent history
-        let recent = conn.prepare("
-            SELECT * FROM history
-            WHERE start_time > ?1
-            ORDER BY start_time DESC
-            LIMIT ?2
-        ")?.query_map(
-            params![now() - self.config.index.max_age, self.config.index.max_entries],
-            |row| Ok(RecentEntry::from(row))
+        // 4. Rebuild left-right index from recent history using sequence tracking
+        // Uses SQLite rowid as sequence number for efficient incremental recovery
+        let last_indexed_rowid: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT value FROM index_state WHERE key = 'last_indexed_rowid'), 0)",
+            [],
+            |row| row.get(0)
         )?;
 
-        for entry in recent {
-            self.index_writer.insert(entry?);
+        let recent = conn.prepare("
+            SELECT rowid, * FROM history
+            WHERE rowid > ?1
+              AND start_time > ?2
+            ORDER BY rowid ASC
+            LIMIT ?3
+        ")?.query_map(
+            params![last_indexed_rowid, now() - self.config.index.max_age, self.config.index.max_entries],
+            |row| {
+                let rowid: i64 = row.get(0)?;
+                let entry = RecentEntry::from_row_offset(row, 1)?;
+                Ok((rowid, entry))
+            }
+        )?;
+
+        let mut max_rowid = last_indexed_rowid;
+        for result in recent {
+            let (rowid, entry) = result?;
+            self.index_writer.insert(entry);
+            max_rowid = max_rowid.max(rowid);
         }
         self.index_writer.publish();
+
+        // Persist high water mark for next recovery
+        if max_rowid > last_indexed_rowid {
+            conn.execute(
+                "INSERT OR REPLACE INTO index_state (key, value) VALUES ('last_indexed_rowid', ?1)",
+                params![max_rowid],
+            )?;
+        }
 
         // 5. Rebuild vector clock from operation log (tracks latest HLC per origin)
         let vector_clock: HashMap<NodeId, HLC> = conn.prepare("
@@ -4545,9 +4589,20 @@ pub enum HlcError {
 ///
 /// Ordering: HLCs are ordered by (wall_time, logical, node_id)
 /// This provides a total order even for concurrent events.
+///
+/// CORRECTNESS NOTE: The derived Ord implementation compares fields in declaration order:
+/// 1. wall_time (primary) - timestamp in milliseconds
+/// 2. logical (secondary) - counter for events at same wall_time
+/// 3. node_id (tertiary) - tie-breaker for concurrent events
+///
+/// This ordering is correct because:
+/// - Later wall_time means causally later or concurrent
+/// - Higher logical at same wall_time means later in causal chain
+/// - node_id provides deterministic tie-breaking for truly concurrent events
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct HLC {
     /// Wall clock time (milliseconds since epoch)
+    /// IMPORTANT: Field order matters for derived Ord - do not reorder
     pub wall_time: u64,
     /// Logical counter for events at same wall time
     pub logical: u32,
@@ -4630,6 +4685,7 @@ impl HLC {
     }
 
     /// Update clock after receiving a remote timestamp
+    /// Fast-forwards local clock to max(local, remote, wall) to ensure causality
     /// Returns error if remote clock is too far ahead (clock skew exceeded)
     pub fn receive(&mut self, remote: &HLC, local_node: NodeId) -> Result<HLC, HlcError> {
         let wall = Self::current_wall_time();
@@ -4643,27 +4699,31 @@ impl HLC {
             });
         }
 
-        let (new_wall, new_logical) = if wall > self.wall_time && wall > remote.wall_time {
-            (wall, 0)
-        } else if self.wall_time > remote.wall_time {
-            let logical = self.logical.checked_add(1)
-                .ok_or(HlcError::LogicalOverflow)?;
-            (self.wall_time, logical)
-        } else if remote.wall_time > self.wall_time {
-            let logical = remote.logical.checked_add(1)
-                .ok_or(HlcError::LogicalOverflow)?;
-            (remote.wall_time, logical)
+        // Fast-forward to max(local, remote, wall)
+        // This ensures we don't waste logical counter on old messages
+        let max_wall = wall.max(self.wall_time).max(remote.wall_time);
+
+        let new_logical = if max_wall > self.wall_time && max_wall > remote.wall_time {
+            // Wall clock advanced past both - reset logical to 0
+            0
+        } else if max_wall == self.wall_time && max_wall > remote.wall_time {
+            // Local is ahead - no need to increment for old remote
+            // Return current state (already causally ahead)
+            self.logical
+        } else if max_wall == remote.wall_time && max_wall > self.wall_time {
+            // Remote is ahead - advance past remote
+            remote.logical.checked_add(1).ok_or(HlcError::LogicalOverflow)?
         } else {
-            let logical = self.logical.max(remote.logical).checked_add(1)
-                .ok_or(HlcError::LogicalOverflow)?;
-            (self.wall_time, logical)
+            // Same wall time - advance past max logical
+            self.logical.max(remote.logical).checked_add(1)
+                .ok_or(HlcError::LogicalOverflow)?
         };
 
-        self.wall_time = new_wall;
+        self.wall_time = max_wall;
         self.logical = new_logical;
 
         Ok(HLC {
-            wall_time: new_wall,
+            wall_time: max_wall,
             logical: new_logical,
             node_id: local_node,
         })
@@ -6172,6 +6232,14 @@ CREATE TABLE IF NOT EXISTS peers (
     last_seen INTEGER
 );
 
+-- Index recovery state: tracks high water mark for crash recovery
+-- Uses SQLite's INTEGER PRIMARY KEY as implicit sequence (rowid alias)
+CREATE TABLE IF NOT EXISTS index_state (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+-- INSERT OR REPLACE INTO index_state (key, value) VALUES ('last_indexed_rowid', ?)
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS operation_log_hlc ON operation_log(timestamp_wall, timestamp_logical);
 CREATE INDEX IF NOT EXISTS operation_log_origin_hlc ON operation_log(origin, timestamp_wall, timestamp_logical);
@@ -7367,15 +7435,21 @@ $ histdb unstar "docker run"
 **Conflict resolution for starred:**
 
 ```rust
-// Starred flag uses LWW with bias toward preservation
+// Starred flag uses pure LWW with node_id tie-breaker (consistent with HLC ordering)
+// No value bias - deterministic based on node_id for reproducible merge results
 pub fn merge_starred(local: &LWWRegister<bool>, remote: &LWWRegister<bool>) -> bool {
-    if local.timestamp == remote.timestamp {
-        // Tie-breaker: preserve (starred = true) wins
-        local.value || remote.value
-    } else if local.timestamp > remote.timestamp {
-        local.value
-    } else {
-        remote.value
+    match local.timestamp.cmp(&remote.timestamp) {
+        Ordering::Greater => local.value,
+        Ordering::Less => remote.value,
+        Ordering::Equal => {
+            // Tie-breaker: higher node_id wins (consistent with HLC Ord)
+            // This ensures deterministic merge regardless of which node merges first
+            if local.timestamp.node_id >= remote.timestamp.node_id {
+                local.value
+            } else {
+                remote.value
+            }
+        }
     }
 }
 ```
