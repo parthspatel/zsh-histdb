@@ -1605,22 +1605,21 @@ impl WriterThread {
                     // - Sync brought FinishCommand before StartCommand
                     let updated = self.update_finish(&tx, history_id, exit_status, duration_ms)?;
 
-                    if !updated {
-                        // Create placeholder entry with argv=NULL
-                        // Allows reconstruction from sync later
+                    if updated {
+                        // StartCommand existed - update index to reflect exit status
+                        index_ops.push(IndexOp::UpdateExitStatus {
+                            history_id,
+                            exit_status,
+                            duration_ms,
+                        });
+                    } else {
+                        // Orphaned FinishCommand - create DB placeholder, skip index update
+                        // Index has no entry for this history_id (StartCommand never arrived)
+                        // When StartCommand arrives via sync, it will populate the index
                         tracing::warn!("Orphaned FinishCommand for {}, creating placeholder", history_id);
                         self.insert_placeholder(&tx, history_id, exit_status, duration_ms)?;
+                        // No index update - entry doesn't exist in index
                     }
-
-                    // Note: For orphaned FinishCommand, this update will be a no-op since
-                    // the entry isn't in the index. This is intentional - absorb_first
-                    // gracefully ignores updates for missing entries. When StartCommand
-                    // eventually arrives via sync, the index will be populated correctly.
-                    index_ops.push(IndexOp::UpdateExitStatus {
-                        history_id,
-                        exit_status,
-                        duration_ms,
-                    });
                 }
             }
         }
