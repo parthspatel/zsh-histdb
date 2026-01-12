@@ -2441,26 +2441,36 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigDuration(pub u64);  // Stored as seconds internally
 
+/// Maximum allowed duration: 365 days (prevents overflow in as_chrono)
+const MAX_DURATION_SECS: u64 = 365 * 24 * 60 * 60;
+
 impl<'de> Deserialize<'de> for ConfigDuration {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
         use serde::de::Error;
         let s = String::deserialize(deserializer)?;
 
-        if let Some(days) = s.strip_suffix('d') {
+        let secs = if let Some(days) = s.strip_suffix('d') {
             let d: u64 = days.parse().map_err(D::Error::custom)?;
-            Ok(ConfigDuration(d * 86400))
+            d * 86400
         } else if let Some(hours) = s.strip_suffix('h') {
             let h: u64 = hours.parse().map_err(D::Error::custom)?;
-            Ok(ConfigDuration(h * 3600))
+            h * 3600
         } else if let Some(secs) = s.strip_suffix('s') {
-            let s: u64 = secs.parse().map_err(D::Error::custom)?;
-            Ok(ConfigDuration(s))
+            secs.parse().map_err(D::Error::custom)?
         } else {
             // Bare number = seconds (backwards compatible)
-            let s: u64 = s.parse().map_err(D::Error::custom)?;
-            Ok(ConfigDuration(s))
+            s.parse().map_err(D::Error::custom)?
+        };
+
+        if secs > MAX_DURATION_SECS {
+            return Err(D::Error::custom(format!(
+                "duration {} exceeds maximum of 365 days ({} seconds)",
+                s, MAX_DURATION_SECS
+            )));
         }
+
+        Ok(ConfigDuration(secs))
     }
 }
 
@@ -3180,6 +3190,7 @@ pub enum FireAndForget {
     FinishCommand {
         history_id: Uuid,    // Same as StartCommand
         exit_status: i32,
+        duration_ms: u64,    // Wall-clock duration from shell
     },
 }
 
@@ -3348,6 +3359,8 @@ _histdb_addhistory() {
 
     # Shell generates UUID for this command (for offline correlation)
     HISTDB_LAST_HISTORY_ID=$(histdb-cli uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
 
     local json='{"type":"StartCommand",'
     json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
@@ -3363,9 +3376,15 @@ _histdb_precmd() {
     local status=$?
     [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
 
+    # Calculate duration in milliseconds
+    local end_time=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
     local json='{"type":"FinishCommand",'
     json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
-    json+='"exit_status":'$status'}'
+    json+='"exit_status":'$status','
+    json+='"duration_ms":'$duration_ms'}'
 
     _histdb_send_or_queue "$json" "finish"
     HISTDB_LAST_HISTORY_ID=""
@@ -3422,6 +3441,8 @@ _histdb_preexec() {
 
     # Shell generates UUID for this command (for offline correlation)
     HISTDB_LAST_HISTORY_ID=$(histdb-cli uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$(($(date +%s) * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
 
     # Escape for JSON
     cmd="${cmd//\\/\\\\}"
@@ -3440,9 +3461,15 @@ _histdb_precmd() {
     local status=$?
     [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
 
+    # Calculate duration in milliseconds
+    local end_time=$(($(date +%s) * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
     local json='{"type":"FinishCommand",'
     json+='"history_id":"'"$HISTDB_LAST_HISTORY_ID"'",'
-    json+='"exit_status":'"$status"'}'
+    json+='"exit_status":'"$status"','
+    json+='"duration_ms":'"$duration_ms"'}'
 
     _histdb_send_or_queue "$json" "finish"
     HISTDB_LAST_HISTORY_ID=""
@@ -3472,6 +3499,7 @@ let-env HISTDB_SOCKET = ($env.HISTDB_SOCKET? | default $"($env.XDG_RUNTIME_DIR? 
 mut histdb_session: string = (histdb-cli uuid)  # Generated once on shell start
 mut histdb_last_history_id: string = ""
 mut histdb_last_cmd: string = ""
+mut histdb_cmd_start_time: int = 0  # Milliseconds since epoch
 
 # Send to daemon or queue offline (uses histdb-cli for consistency)
 def histdb-send-or-queue [msg: string, msg_type: string] {
@@ -3487,10 +3515,13 @@ def histdb-send-or-queue [msg: string, msg_type: string] {
 $env.config.hooks.pre_execution = {||
     # Finish previous command first (using LAST_EXIT_CODE from previous execution)
     if ($histdb_last_history_id | is-not-empty) {
+        let end_time = (date now | into int) / 1_000_000  # Convert ns to ms
+        let duration_ms = ($end_time - $histdb_cmd_start_time) | math max 0
         let finish_json = {
             type: "FinishCommand"
             history_id: $histdb_last_history_id
             exit_status: ($env.LAST_EXIT_CODE? | default 0)
+            duration_ms: $duration_ms
         } | to json
         histdb-send-or-queue $finish_json "finish"
     }
@@ -3504,6 +3535,8 @@ $env.config.hooks.pre_execution = {||
 
     # Shell generates history_id (for offline correlation)
     $histdb_last_history_id = (histdb-cli uuid)
+    # Record start time for duration calculation
+    $histdb_cmd_start_time = (date now | into int) / 1_000_000  # Convert ns to ms
 
     let start_json = {
         type: "StartCommand"
@@ -3526,10 +3559,13 @@ $env.config.hooks.pre_prompt = {||
 # On shell exit, finish any pending command
 def histdb-cleanup [] {
     if ($histdb_last_history_id | is-not-empty) {
+        let end_time = (date now | into int) / 1_000_000  # Convert ns to ms
+        let duration_ms = ($end_time - $histdb_cmd_start_time) | math max 0
         let finish_json = {
             type: "FinishCommand"
             history_id: $histdb_last_history_id
             exit_status: ($env.LAST_EXIT_CODE? | default 0)
+            duration_ms: $duration_ms
         } | to json
         histdb-send-or-queue $finish_json "finish"
     }
@@ -3711,6 +3747,8 @@ _histdb_addhistory() {
 
     # Shell generates UUID for this history entry (prevents offline/online collision)
     HISTDB_LAST_HISTORY_ID=$(_histdb_generate_uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
 
     local json='{"type":"StartCommand",'
     json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'  # Shell-generated UUID
@@ -3726,9 +3764,15 @@ _histdb_precmd() {
     local status=$?
     [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
 
+    # Calculate duration in milliseconds
+    local end_time=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
     local json='{"type":"FinishCommand",'
     json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
-    json+='"exit_status":'$status'}'
+    json+='"exit_status":'$status','
+    json+='"duration_ms":'$duration_ms'}'
 
     # Queue FinishCommand too - don't lose exit status on daemon restart
     _histdb_send_or_queue "$json" "finish"
@@ -3755,7 +3799,7 @@ pub struct OfflineQueueArgs {
     #[arg(long)]
     json: String,
 
-    /// HLC timestamp as JSON: {"wall_time":..., "logical":..., "node_id":"..."}
+    /// HLC timestamp as JSON: {"wall_time":..., "logical":..., "node_id":...}
     #[arg(long)]
     hlc: String,
 }
@@ -3775,7 +3819,7 @@ pub fn handle_offline_queue(args: OfflineQueueArgs) -> Result<()> {
             &args.json,
             hlc.wall_time,
             hlc.logical,
-            &hlc.node_id,
+            hlc.node_id,
         ],
     )?;
 
@@ -3786,7 +3830,7 @@ pub fn handle_offline_queue(args: OfflineQueueArgs) -> Result<()> {
 struct HlcJson {
     wall_time: u64,
     logical: u32,
-    node_id: String,
+    node_id: u64,  // NodeId is u64 (hash of identity key)
 }
 
 // New CLI command: get current HLC
@@ -5001,7 +5045,7 @@ impl<T: Clone> LWWRegister<T> {
     ///
     /// Resolution order:
     /// 1. Higher HLC timestamp wins (wall_time, then logical counter)
-    /// 2. If HLC equal, higher node_id wins (lexicographic comparison)
+    /// 2. If HLC equal, higher node_id wins (numeric comparison)
     ///
     /// This ensures deterministic convergence even with clock skew.
     pub fn merge(&mut self, other: &Self) {
@@ -5027,7 +5071,7 @@ impl<T: Clone> LWWRegister<T> {
             std::cmp::Ordering::Equal => {}
         }
 
-        // Tie-breaker: lexicographic node_id comparison
+        // Tie-breaker: numeric node_id comparison (NodeId is u64)
         // Higher node_id wins - ensures deterministic convergence
         other_ts.node_id > self.timestamp.node_id
     }
@@ -5041,11 +5085,11 @@ mod lww_tests {
     fn test_lww_higher_timestamp_wins() {
         let mut reg1 = LWWRegister::new(
             42,
-            HLC { wall_time: 100, logical: 0, node_id: "node-a".into() },
+            HLC { wall_time: 100, logical: 0, node_id: 1 },
         );
         let reg2 = LWWRegister::new(
             99,
-            HLC { wall_time: 200, logical: 0, node_id: "node-b".into() },
+            HLC { wall_time: 200, logical: 0, node_id: 2 },
         );
 
         reg1.merge(&reg2);
@@ -5057,23 +5101,23 @@ mod lww_tests {
         // Same wall_time and logical, different node_id
         let mut reg1 = LWWRegister::new(
             42,
-            HLC { wall_time: 100, logical: 5, node_id: "node-a".into() },
+            HLC { wall_time: 100, logical: 5, node_id: 1 },
         );
         let reg2 = LWWRegister::new(
             99,
-            HLC { wall_time: 100, logical: 5, node_id: "node-z".into() },
+            HLC { wall_time: 100, logical: 5, node_id: 100 },
         );
 
         reg1.merge(&reg2);
-        // node-z > node-a lexicographically, so reg2 wins
+        // node_id 100 > 1 numerically, so reg2 wins
         assert_eq!(reg1.value, 99);
     }
 
     #[test]
     fn test_lww_convergence_is_deterministic() {
         // Both nodes start with different values, same timestamp
-        let ts_a = HLC { wall_time: 100, logical: 0, node_id: "node-a".into() };
-        let ts_b = HLC { wall_time: 100, logical: 0, node_id: "node-b".into() };
+        let ts_a = HLC { wall_time: 100, logical: 0, node_id: 1 };
+        let ts_b = HLC { wall_time: 100, logical: 0, node_id: 2 };
 
         let mut node_a = LWWRegister::new("value-a", ts_a.clone());
         let mut node_b = LWWRegister::new("value-b", ts_b.clone());
@@ -5085,7 +5129,7 @@ mod lww_tests {
         let node_a_copy = LWWRegister::new("value-a", ts_a);
         node_b.merge(&node_a_copy);
 
-        // Both nodes converge to same value (node-b wins, higher node_id)
+        // Both nodes converge to same value (node_id 2 > 1, so node_b wins)
         assert_eq!(node_a.value, node_b.value);
         assert_eq!(node_a.value, "value-b");
     }
@@ -5913,7 +5957,7 @@ impl Daemon {
         let log_entry = self.log.append(Operation::Insert(entry.clone()))?;
 
         // 3. Apply to local state immediately
-        self.state.write().entries.insert(uuid, entry);
+        self.state.write().entries.insert(history_id, entry);
 
         // 4. Broadcast to peers (async, fire-and-forget)
         let sync = self.sync.clone();
@@ -5921,15 +5965,15 @@ impl Daemon {
             sync.broadcast(log_entry).await;
         });
 
-        Ok(uuid)
+        Ok(history_id)
     }
 
     /// Update exit status - LWW semantics
-    pub async fn finish_command(&self, uuid: Uuid, exit_status: i32, duration: u64) -> Result<(), Error> {
+    pub async fn finish_command(&self, history_id: Uuid, exit_status: i32, duration: u64) -> Result<(), Error> {
         let timestamp = self.log.hlc.lock().tick(self.node_id)?;
 
         let op = Operation::UpdateStatus {
-            entry_id: uuid,
+            entry_id: history_id,
             exit_status: LWWRegister::new(exit_status, timestamp),
             duration: LWWRegister::new(duration, timestamp),
         };
