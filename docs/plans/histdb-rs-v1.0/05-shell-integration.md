@@ -1,0 +1,1026 @@
+# Shell Integration & IPC Protocol
+
+*Part of the [histdb-rs v1.0 architecture](README.md). Source: original ARCHITECTURE.md L3138–4085, L6122–6348, L7009–7037.*
+
+## Multi-Shell Integration (`shell/`)
+
+**Architecture**: Shell-agnostic daemon with thin shell wrappers
+
+```
+┌─────────────┐
+│     ZSH     │──┐
+└─────────────┘  │
+┌─────────────┐  │   Unix Socket      ┌─────────────────┐
+│    BASH     │──┼──────────────────►│  histdb-daemon  │
+└─────────────┘  │   JSON protocol    │  (Rust binary)  │
+┌─────────────┐  │                    └────────┬────────┘
+│   Nushell   │──┘                             │
+└─────────────┘                                ▼
+                                      ┌─────────────────┐
+                                      │    SQLite DB    │
+                                      └─────────────────┘
+```
+
+### Protocol (`daemon/protocol.rs`)
+
+> **Review:** ID/timestamp ownership is contradictory (shell-generated IDs vs. 'shell tracks returned ID'; daemon-stamped `start_time` breaks spool replay). `start_time_ms` was added to `StartCommand` here as the minimum fix. [F4](REVIEW.md#f4)
+
+The IPC protocol uses JSON over Unix sockets. All IDs are UUIDv7 strings for
+global uniqueness and time-ordering.
+
+```rust
+use uuid::Uuid;
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+/// Protocol split into two categories:
+/// 1. Fire-and-Forget: shell sends, daemon ACKs, shell ignores response
+/// 2. Request-Response: shell sends, waits for daemon response
+
+// ============================================================================
+// FIRE-AND-FORGET MESSAGES (shell ignores response, but daemon sends ACK)
+// Used for: command recording (StartCommand, FinishCommand)
+// Properties: offline-queueable, idempotent, can be replayed
+// ============================================================================
+
+/// Fire-and-forget request - shell doesn't wait for response content
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FireAndForget {
+    /// Record command start (shell generates history_id)
+    StartCommand {
+        history_id: Uuid,    // Shell-generated UUIDv7
+        session_id: Uuid,    // Shell session
+        argv: String,
+        dir: String,
+        start_time_ms: i64,  // Shell-side start time (needed for spool replay)
+    },
+
+    /// Record command completion
+    FinishCommand {
+        history_id: Uuid,    // Same as StartCommand
+        exit_status: i32,
+        duration_ms: u64,    // Wall-clock duration from shell
+    },
+}
+
+/// Minimal ACK for fire-and-forget (shell checks exit code, not content)
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FireAndForgetAck {
+    /// Request accepted and queued
+    Accepted,
+    /// Queue full but accepted into overflow buffer (async processing)
+    AcceptedOverflow,
+    /// Queue full, retry later (shell should queue offline)
+    QueueFull,
+}
+
+// ============================================================================
+// REQUEST-RESPONSE MESSAGES (shell waits for and uses response)
+// Used for: queries, status checks, admin commands
+// Properties: NOT offline-queueable, require daemon to be running
+// ============================================================================
+
+/// Request-response request - shell waits for and processes response
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Request {
+    /// Query history
+    Query {
+        pattern: Option<String>,
+        limit: usize,
+        offset: usize,
+        filters: QueryFilters,
+    },
+
+    /// Get command status (for long-running commands)
+    GetStatus {
+        history_id: Uuid,
+    },
+
+    /// Graceful shutdown (admin only)
+    Shutdown,
+}
+
+/// Response to request-response messages
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum Response {
+    /// Query results
+    QueryResults {
+        entries: Vec<HistoryEntry>,
+        total_count: usize,
+    },
+
+    /// Command status response
+    Status {
+        history_id: Uuid,
+        state: CommandState,
+    },
+
+    /// Error response
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+
+    /// Command started successfully (for start-with-id request)
+    CommandStarted {
+        history_id: Uuid,
+    },
+
+    /// Queue full, client should retry or queue offline
+    QueueFull,
+
+    /// Request timed out waiting for processing
+    Timeout,
+}
+
+/// State of a command in the system
+#[derive(Serialize, Deserialize)]
+pub enum CommandState {
+    /// Command started, waiting for finish
+    Running { started_at: i64 },
+    /// Command completed
+    Completed { exit_status: i32, duration_ms: u64 },
+    /// Command not found
+    NotFound,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum ErrorCode {
+    InvalidRequest,
+    NotFound,
+    QueueFull,
+    Internal,
+}
+```
+
+**Protocol Notes:**
+- No `Register` needed - session_id is shell-generated UUIDv7
+- `history_id` generated by shell enables idempotent offline replay
+- `GetStatus` allows checking if a command completed (for crash recovery)
+
+### ZSH Integration (`shell/zsh/histdb.zsh`)
+
+> **Review:** these hooks fork 4–8 processes per prompt (`$(histdb-cli uuid)`, `$(date +%N | cut)` ×2) — the dominant latency — and build JSON by escaping only `"`, so multi-line commands produce invalid JSON and fields can be injected. [F1](REVIEW.md#f1), [F2](REVIEW.md#f2)
+
+```zsh
+# histdb ZSH integration - UUID-based, offline-capable
+autoload -U add-zsh-hook
+
+typeset -g HISTDB_SOCKET="${HISTDB_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/histdb-${UID}.sock}"
+typeset -g HISTDB_SESSION=""           # UUIDv7 session ID
+typeset -g HISTDB_LAST_HISTORY_ID=""   # UUIDv7 for current command
+
+# Generate session ID on first use
+_histdb_init() {
+    [[ -n $HISTDB_SESSION ]] && return
+    # Generate UUIDv7 for this shell session
+    HISTDB_SESSION=$(histdb-cli uuid)
+}
+
+# Fire-and-forget socket send with non-blocking poll
+# Protocol is fire-and-forget: daemon ACKs via exit code, not response body
+# Shell queues offline if socket unavailable or write fails
+if zmodload zsh/net/socket 2>/dev/null; then
+    _histdb_send() {
+        local fd
+        # Non-blocking connect with poll
+        zsocket $HISTDB_SOCKET && fd=$REPLY || return 1
+
+        # Use zselect for non-blocking write check (if available)
+        if zmodload zsh/zselect 2>/dev/null; then
+            # Poll for write-ready with 100ms timeout
+            local -a ready
+            zselect -t 10 -w $fd ready  # 10 = 100ms in centiseconds
+            if (( ${#ready} == 0 )); then
+                exec {fd}>&-
+                return 1  # Timeout - queue offline
+            fi
+        fi
+
+        # Fire-and-forget: send and close immediately
+        # Daemon sends minimal ACK but we don't wait for it
+        print -u $fd -- "$1"
+        exec {fd}>&-
+        return 0
+    }
+else
+    _histdb_send() {
+        # socat with 1s timeout, fire-and-forget (no response expected)
+        print -- "$1" | socat -t1 - UNIX-CONNECT:$HISTDB_SOCKET 2>/dev/null
+    }
+fi
+
+_histdb_addhistory() {
+    _histdb_init
+    local cmd="${1[1,-2]}"  # Remove trailing newline
+    [[ -z "$cmd" ]] && return 0
+
+    # Shell generates UUID for this command (for offline correlation)
+    HISTDB_LAST_HISTORY_ID=$(histdb-cli uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+
+    local json='{"type":"StartCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
+    json+='"session_id":"'$HISTDB_SESSION'",'
+    json+='"argv":"'${cmd//\"/\\\"}'",'
+    json+='"dir":"'${PWD//\"/\\\"}'"}'
+
+    _histdb_send_or_queue "$json" "start"
+    return 0
+}
+
+_histdb_precmd() {
+    local status=$?
+    [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
+
+    # Calculate duration in milliseconds
+    local end_time=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
+    local json='{"type":"FinishCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
+    json+='"exit_status":'$status','
+    json+='"duration_ms":'$duration_ms'}'
+
+    _histdb_send_or_queue "$json" "finish"
+    HISTDB_LAST_HISTORY_ID=""
+}
+
+add-zsh-hook zshaddhistory _histdb_addhistory
+add-zsh-hook precmd _histdb_precmd
+```
+
+### BASH Integration (`shell/bash/histdb.bash`)
+```bash
+# histdb BASH integration - UUID-based, offline-capable
+HISTDB_SOCKET="${HISTDB_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/histdb-$(id -u).sock}"
+HISTDB_SESSION=""
+HISTDB_LAST_HISTORY_ID=""  # Shell-generated UUIDv7
+HISTDB_LAST_CMD=""
+
+_histdb_send() {
+    echo "$1" | socat -t1 - UNIX-CONNECT:"$HISTDB_SOCKET" 2>/dev/null
+}
+
+# Send to daemon or queue offline with warning
+_histdb_send_or_queue() {
+    local json="$1" msg_type="$2"
+
+    # Try daemon first
+    if histdb-cli send "$json" 2>/dev/null; then
+        return 0
+    fi
+
+    # Daemon unavailable - queue offline AND warn user
+    histdb-cli queue "$msg_type" "$json"
+
+    # Warn user (stderr, yellow if terminal supports it)
+    if [[ -t 2 ]]; then
+        echo -e "\e[33mhistdb: daemon unavailable, command queued offline\e[0m" >&2
+    else
+        echo "histdb: daemon unavailable, command queued offline" >&2
+    fi
+
+    return 1
+}
+
+_histdb_init() {
+    [[ -n "$HISTDB_SESSION" ]] && return
+    # Generate UUIDv7 for this shell session
+    HISTDB_SESSION=$(histdb-cli uuid)
+}
+
+_histdb_preexec() {
+    _histdb_init
+    local cmd="$1"
+    [[ -z "$cmd" ]] && return
+
+    # Shell generates UUID for this command (for offline correlation)
+    HISTDB_LAST_HISTORY_ID=$(histdb-cli uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$(($(date +%s) * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+
+    # Escape for JSON
+    cmd="${cmd//\\/\\\\}"
+    cmd="${cmd//\"/\\\"}"
+    cmd="${cmd//$'\n'/\\n}"
+    local json='{"type":"StartCommand",'
+    json+='"history_id":"'"$HISTDB_LAST_HISTORY_ID"'",'
+    json+='"session_id":"'"$HISTDB_SESSION"'",'
+    json+='"argv":"'"$cmd"'",'
+    json+='"dir":"'"${PWD//\"/\\\"}"'"}'
+
+    _histdb_send_or_queue "$json" "start"
+}
+
+_histdb_precmd() {
+    local status=$?
+    [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
+
+    # Calculate duration in milliseconds
+    local end_time=$(($(date +%s) * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
+    local json='{"type":"FinishCommand",'
+    json+='"history_id":"'"$HISTDB_LAST_HISTORY_ID"'",'
+    json+='"exit_status":'"$status"','
+    json+='"duration_ms":'"$duration_ms"'}'
+
+    _histdb_send_or_queue "$json" "finish"
+    HISTDB_LAST_HISTORY_ID=""
+}
+
+# BASH doesn't have preexec, use DEBUG trap
+_histdb_debug() {
+    [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
+    [[ "$BASH_COMMAND" == "_histdb_precmd" ]] && return
+    [[ "$HISTDB_LAST_CMD" == "$BASH_COMMAND" ]] && return
+    HISTDB_LAST_CMD="$BASH_COMMAND"
+    _histdb_preexec "$BASH_COMMAND"
+}
+
+trap '_histdb_debug' DEBUG
+PROMPT_COMMAND="_histdb_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+```
+
+### Nushell Integration (`shell/nu/histdb.nu`)
+```nu
+# histdb Nushell integration - UUID-based, offline-capable
+# Matches ZSH/BASH: shell generates all UUIDs, supports offline queue
+
+let-env HISTDB_SOCKET = ($env.HISTDB_SOCKET? | default $"($env.XDG_RUNTIME_DIR? | default '/tmp')/histdb-($env.USER).sock")
+
+# Shell-generated UUIDs (same as ZSH/BASH)
+mut histdb_session: string = (histdb-cli uuid)  # Generated once on shell start
+mut histdb_last_history_id: string = ""
+mut histdb_last_cmd: string = ""
+mut histdb_cmd_start_time: int = 0  # Milliseconds since epoch
+
+# Send to daemon or queue offline (uses histdb-cli for consistency)
+def histdb-send-or-queue [msg: string, msg_type: string] {
+    let result = (do { histdb-cli send $msg } | complete)
+    if $result.exit_code != 0 {
+        # Daemon unavailable - queue to disk spool via CLI
+        histdb-cli queue $msg_type $msg
+        print -e $"(ansi yellow)histdb: queued offline(ansi reset)"
+    }
+}
+
+# Hook into command execution (pre_execution)
+$env.config.hooks.pre_execution = {||
+    # Finish previous command first (using LAST_EXIT_CODE from previous execution)
+    if ($histdb_last_history_id | is-not-empty) {
+        let end_time = (date now | into int) / 1_000_000  # Convert ns to ms
+        let duration_ms = ($end_time - $histdb_cmd_start_time) | math max 0
+        let finish_json = {
+            type: "FinishCommand"
+            history_id: $histdb_last_history_id
+            exit_status: ($env.LAST_EXIT_CODE? | default 0)
+            duration_ms: $duration_ms
+        } | to json
+        histdb-send-or-queue $finish_json "finish"
+    }
+
+    # Now start the new command
+    let cmd = (commandline)
+    if ($cmd | is-empty) {
+        $histdb_last_history_id = ""
+        return
+    }
+
+    # Shell generates history_id (for offline correlation)
+    $histdb_last_history_id = (histdb-cli uuid)
+    # Record start time for duration calculation
+    $histdb_cmd_start_time = (date now | into int) / 1_000_000  # Convert ns to ms
+
+    let start_json = {
+        type: "StartCommand"
+        history_id: $histdb_last_history_id
+        session_id: $histdb_session
+        argv: $cmd
+        dir: $env.PWD
+    } | to json
+
+    histdb-send-or-queue $start_json "start"
+    $histdb_last_cmd = $cmd
+}
+
+# Handle shell exit - finish last command
+$env.config.hooks.pre_prompt = {||
+    # This runs before each prompt, after command completes
+    # We handle finish in pre_execution instead for proper exit code capture
+}
+
+# On shell exit, finish any pending command
+def histdb-cleanup [] {
+    if ($histdb_last_history_id | is-not-empty) {
+        let end_time = (date now | into int) / 1_000_000  # Convert ns to ms
+        let duration_ms = ($end_time - $histdb_cmd_start_time) | math max 0
+        let finish_json = {
+            type: "FinishCommand"
+            history_id: $histdb_last_history_id
+            exit_status: ($env.LAST_EXIT_CODE? | default 0)
+            duration_ms: $duration_ms
+        } | to json
+        histdb-send-or-queue $finish_json "finish"
+    }
+}
+```
+
+**Nushell Exit Status Handling:**
+- Uses `$env.LAST_EXIT_CODE` captured at next command's pre_execution
+- Exit status is recorded one command behind (when next command starts)
+- Shell exit handler ensures final command is recorded
+
+### Shell Feature Matrix
+
+| Feature | ZSH | BASH | Nushell |
+|---------|-----|------|---------|
+| Command recording | ✅ | ✅ | ✅ |
+| Exit status | ✅ | ✅ | ✅ (delayed*) |
+| Command duration | ✅ | ✅ | ✅ |
+| Native socket | ✅ (zsh/net/socket) | ❌ (histdb-cli) | ❌ (histdb-cli) |
+| Offline queue | ✅ | ✅ | ✅ (via histdb-cli) |
+| Interactive search | ✅ (widget) | ✅ (fzf) | ✅ (menu) |
+| Shell-generated UUIDs | ✅ | ✅ | ✅ |
+
+*Nushell exit status: captured at next command start via `$env.LAST_EXIT_CODE`
+
+### Shell Offline Queue (Disk Spool)
+
+When the daemon is unavailable, shells queue commands to a spool directory using
+atomic rename for durability. This provides **near 100% reliability** - no
+commands are lost, even on crash.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  Shell Offline Queue (Disk Spool)                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Shell executes command                                                 │
+│          │                                                               │
+│          ▼                                                               │
+│   ┌──────────────┐     success    ┌─────────────────┐                   │
+│   │ Try daemon   │ ─────────────► │ Command recorded │                   │
+│   │ socket       │                │ (normal path)    │                   │
+│   └──────────────┘                └─────────────────┘                   │
+│          │ fail                                                          │
+│          ▼                                                               │
+│   ┌──────────────────────────────────────┐                              │
+│   │ 1. Write to temp file                │                              │
+│   │    ~/.local/share/histdb/spool/.tmp_*│                              │
+│   │ 2. Atomic rename to spool dir        │   ← Single syscall, crash-safe│
+│   │    ~/.local/share/histdb/spool/*.json│                              │
+│   └──────────────────────────────────────┘                              │
+│          │                                                               │
+│          ▼ (daemon handles replay on startup/connect)                   │
+│   ┌──────────────────────────────────────┐                              │
+│   │ Daemon scans spool directory         │                              │
+│   │ - On startup (cleanup temp files)    │                              │
+│   │ - On new shell connection            │                              │
+│   │ - Periodic background scan (30s)     │                              │
+│   │ - Process files in timestamp order   │                              │
+│   └──────────────────────────────────────┘                              │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why Disk Spool Instead of SQLite:**
+- Simpler crash semantics: file either exists (complete) or doesn't
+- Atomic rename is a single syscall - no journal corruption risk
+- Faster for shells (no SQLite open/close overhead)
+- Easier to debug (just `ls` the spool directory)
+
+**Spool file format (JSON):**
+```json
+{
+    "type": "start",
+    "payload": {"type":"StartCommand","history_id":"...","argv":"..."},
+    "queued_at": 1704067200
+}
+```
+
+**Key Design Decisions:**
+
+1. **Shell generates all UUIDs (canonical)**: The shell generates `history_id` (UUIDv7) before sending to daemon.
+   - **Offline correlation**: Shell tracks ID for later FinishCommand when daemon unavailable
+   - **Idempotent replay**: Same UUID = same entry, INSERT OR IGNORE deduplicates
+   - **No round-trip**: Shell proceeds immediately without waiting for daemon response
+   - **UUIDv7 safety**: Time-ordered, 122-bit random, collision-resistant enough for local generation
+
+2. **Shell-side start time travels in the payload**: replayed commands keep their original
+   `start_time`. (**Review:** the original protocol let the daemon stamp `Utc::now()` and relied
+   on the HLC for replay ordering; with HLC gone, `StartCommand` must carry `start_time_ms` — see
+   [REVIEW.md](REVIEW.md#f4).)
+
+3. **FinishCommand also queued**: Exit status is just as important as command start - queue both.
+
+**Shell implementation (ZSH example with disk spool):**
+
+```zsh
+# histdb.zsh - with disk spool offline queue and shell-generated UUIDs
+typeset -g HISTDB_SPOOL_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/histdb/spool"
+typeset -g HISTDB_LAST_HISTORY_ID=""  # Shell-generated UUID for correlation
+
+# Generate UUIDv7 using CLI helper (shell generates, not daemon)
+_histdb_generate_uuid() {
+    histdb-cli uuid  # Generate UUIDv7
+}
+
+_histdb_queue_offline() {
+    local request_type="$1" json="$2"
+
+    # Option B: Disk spill with atomic rename for durability
+    # Write to temp file first, then atomic rename to spool directory
+    # Daemon processes spool files later - more durable than direct SQLite
+    local spool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/histdb/spool"
+    [[ -d "$spool_dir" ]] || mkdir -p "$spool_dir"
+
+    # Generate unique filename: timestamp_nano_random.json
+    local timestamp=$(date +%s%N 2>/dev/null || date +%s)
+    local filename="${timestamp}_${RANDOM}.json"
+    local temp_file="${spool_dir}/.tmp_${filename}"
+    local final_file="${spool_dir}/${filename}"
+
+    # Write to temp file (crash-safe: either complete or not present)
+    {
+        print -r -- "{\"type\":\"${request_type}\","
+        print -r -- "\"payload\":${json},"
+        print -r -- "\"queued_at\":$(date +%s)}"
+    } > "$temp_file"
+
+    # Atomic rename - single syscall, crash-safe
+    # If crash happens before rename: temp file cleaned up on next boot
+    # If crash happens after rename: file is safely spooled
+    mv "$temp_file" "$final_file"
+}
+
+_histdb_send_or_queue() {
+    local json="$1" request_type="$2"
+
+    # Try daemon first with timeout
+    local resp
+    if resp=$(_histdb_send "$json" 2>/dev/null); then
+        if [[ -n "$resp" ]]; then
+            return 0
+        fi
+    fi
+
+    # Daemon unavailable - queue offline AND warn user
+    _histdb_queue_offline "$request_type" "$json"
+
+    # Warn user (stderr, yellow if supported)
+    if [[ -t 2 ]]; then
+        print -u2 "\e[33mhistdb: daemon unavailable, command queued offline\e[0m"
+    else
+        print -u2 "histdb: daemon unavailable, command queued offline"
+    fi
+
+    return 1
+}
+
+# Updated hook: shell generates history_id UUID
+_histdb_addhistory() {
+    _histdb_init
+    local cmd="${1[1,-2]}"
+    [[ -z "$cmd" ]] && return 0
+
+    # Shell generates UUID for this history entry (prevents offline/online collision)
+    HISTDB_LAST_HISTORY_ID=$(_histdb_generate_uuid)
+    # Record start time for duration calculation (milliseconds since epoch)
+    HISTDB_CMD_START_TIME=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+
+    local json='{"type":"StartCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'  # Shell-generated UUID
+    json+='"argv":"'${cmd//\"/\\\"}'",'
+    json+='"dir":"'${PWD//\"/\\\"}'","session_id":"'$HISTDB_SESSION'"}'
+
+    _histdb_send_or_queue "$json" "start"
+    return 0
+}
+
+# FinishCommand also uses offline queue (previously fire-and-forget)
+_histdb_precmd() {
+    local status=$?
+    [[ -z "$HISTDB_LAST_HISTORY_ID" ]] && return
+
+    # Calculate duration in milliseconds
+    local end_time=$((EPOCHSECONDS * 1000 + $(date +%N 2>/dev/null | cut -c1-3 || echo 0)))
+    local duration_ms=$((end_time - HISTDB_CMD_START_TIME))
+    [[ $duration_ms -lt 0 ]] && duration_ms=0  # Handle clock skew
+
+    local json='{"type":"FinishCommand",'
+    json+='"history_id":"'$HISTDB_LAST_HISTORY_ID'",'
+    json+='"exit_status":'$status','
+    json+='"duration_ms":'$duration_ms'}'
+
+    # Queue FinishCommand too - don't lose exit status on daemon restart
+    _histdb_send_or_queue "$json" "finish"
+    HISTDB_LAST_HISTORY_ID=""
+}
+
+add-zsh-hook zshaddhistory _histdb_addhistory
+add-zsh-hook precmd _histdb_precmd
+```
+
+> **v1:** the original `cli/offline.rs` (writing an `offline_queue` SQLite table with HLC
+> columns) contradicted the disk-spool design and only existed to carry HLCs; it was
+> removed. Text preserved in [deferred/sync.md](deferred/sync.md#appendix-sync-coupled-fragments-removed-from-v1-docs).
+
+**Daemon-driven replay (Disk Spool with Atomic Rename):**
+
+The daemon is responsible for processing offline queues, not the shell. This ensures:
+- Centralized control over replay timing and rate limiting
+- No shell startup latency from replay
+- Consistent handling across all shell types
+
+**Why Disk Spool Instead of SQLite:**
+- Simpler crash semantics: file either exists (complete) or doesn't
+- Atomic rename is a single syscall - no journal corruption risk
+- Faster for shells (no SQLite open/close overhead)
+- Easier to debug (just `ls` the spool directory)
+- More robust on systems with limited SQLite support
+
+```rust
+// daemon/offline.rs
+
+/// Spool-based offline queue processor - processes JSON files from spool dir
+///
+/// Shell writes: temp file → atomic rename to spool dir
+/// Daemon reads: sorted by filename (timestamp-ordered) → delete after success
+pub struct SpoolQueueProcessor {
+    spool_dir: PathBuf,
+    ingest_queue: Arc<CommandQueue>,
+    scan_interval: Duration,
+    notify: Arc<Notify>,  // For immediate scan triggers
+}
+
+/// Spooled offline entry from shell
+#[derive(Deserialize)]
+struct SpoolEntry {
+    r#type: String,      // "start" or "finish"
+    payload: Value,      // Original request JSON
+    queued_at: i64,      // Unix timestamp when queued
+}
+
+impl SpoolQueueProcessor {
+    pub fn new(data_dir: &Path, ingest_queue: Arc<CommandQueue>) -> Self {
+        Self {
+            spool_dir: data_dir.join("spool"),
+            ingest_queue,
+            scan_interval: Duration::from_secs(30),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Start background processing task
+    pub fn spawn(self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run().await;
+        })
+    }
+
+    /// Trigger immediate scan (called on shell connect)
+    pub fn trigger_scan(&self) {
+        self.notify.notify_one();
+    }
+
+    async fn run(&self) {
+        // Clean up any leftover temp files from crashes
+        self.cleanup_temp_files();
+
+        // Process on startup
+        self.process_spool().await;
+
+        // Then periodically or on trigger
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(self.scan_interval) => {}
+                _ = self.notify.notified() => {}
+            }
+            self.process_spool().await;
+        }
+    }
+
+    /// Remove .tmp_* files left from incomplete writes
+    fn cleanup_temp_files(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.spool_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(".tmp_") {
+                        let _ = std::fs::remove_file(entry.path());
+                        tracing::debug!("Cleaned up temp file: {}", name);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_spool(&self) {
+        if !self.spool_dir.exists() {
+            return;
+        }
+
+        // List and sort spool files by name (timestamp-ordered)
+        let mut files: Vec<_> = match std::fs::read_dir(&self.spool_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|n| n.ends_with(".json") && !n.starts_with(".tmp_"))
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Failed to read spool dir: {}", e);
+                return;
+            }
+        };
+
+        // Sort by filename (timestamp prefix ensures chronological order)
+        files.sort_by_key(|e| e.file_name());
+
+        // Process up to 100 entries per scan
+        for entry in files.into_iter().take(100) {
+            let path = entry.path();
+            let filename = entry.file_name();
+
+            // Read and parse the spool file
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read spool file {:?}: {}", filename, e);
+                    continue;  // Skip corrupted files
+                }
+            };
+
+            let spool_entry: SpoolEntry = match serde_json::from_str(&content) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Failed to parse spool file {:?}: {}", filename, e);
+                    // Move corrupted file to .failed/ for debugging
+                    let failed_dir = self.spool_dir.join(".failed");
+                    let _ = std::fs::create_dir_all(&failed_dir);
+                    let _ = std::fs::rename(&path, failed_dir.join(filename));
+                    continue;
+                }
+            };
+
+            // Replay to ingest queue
+            match self.replay_entry(&spool_entry).await {
+                Ok(()) => {
+                    // Successfully queued - delete spool file
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        tracing::warn!("Failed to delete spool file {:?}: {}", filename, e);
+                    } else {
+                        tracing::debug!("Replayed spool entry {:?}", filename);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to replay {:?}: {} (will retry)", filename, e);
+                    // Don't delete - will retry on next scan
+                    break;  // Stop on first failure to maintain order
+                }
+            }
+        }
+    }
+
+    async fn replay_entry(&self, entry: &SpoolEntry) -> Result<(), Error> {
+        // StartCommand payload carries the shell-side start time, so replay
+        // preserves original timing without any logical clock.
+        let cmd = parse_offline_request(&entry.r#type, &entry.payload)?;
+
+        // Enqueue to normal ingest pipeline
+        self.ingest_queue.push(cmd)
+            .map_err(|_| Error::QueueFull)?;
+
+        Ok(())
+    }
+}
+
+/// Called when a new shell connects - triggers immediate spool scan
+pub fn on_shell_connect(processor: &SpoolQueueProcessor) {
+    processor.trigger_scan();
+}
+```
+
+**Spool directory structure:**
+```
+~/.local/share/histdb/
+├── spool/
+│   ├── 1704067200000000000_12345.json   # Pending entries
+│   ├── 1704067200100000000_12346.json
+│   ├── .tmp_1704067200200000000_12347.json  # Incomplete (cleaned up)
+│   └── .failed/                         # Corrupted files for debugging
+│       └── malformed_entry.json
+└── history.db                           # Main database
+```
+
+**Replay behavior:**
+- Commands replayed in original order (by `queued_at`)
+- Original timestamps preserved (for correct history ordering)
+- Daemon scans on startup, shell connect, and every 30 seconds
+- Rate limited to 100 entries per scan cycle
+
+**Deduplication via UUID:**
+
+Replayed entries use `INSERT ... ON CONFLICT DO UPDATE` with the history UUID as the uniqueness key:
+- Shell generates UUID before queueing (see shell integration)
+- Same UUID may be queued multiple times (retries, reconnects)
+- `ON CONFLICT DO UPDATE` fills in NULL fields from new data (handles placeholder race)
+- This makes replay **idempotent** - safe to replay same entry multiple times
+
+```sql
+-- Deduplication constraint (from migration)
+ALTER TABLE history ADD COLUMN uuid TEXT UNIQUE;
+
+-- Idempotent upsert (used by spool replay)
+-- Handles FinishCommand-before-StartCommand race condition
+INSERT INTO history (uuid, session, command_id, place_id, start_time)
+SELECT ?, ?, c.id, p.id, ?
+FROM commands c, places p
+WHERE c.argv = ? AND p.host = ? AND p.dir = ?
+ON CONFLICT(uuid) DO UPDATE SET
+    session = COALESCE(excluded.session, session),
+    command_id = COALESCE(excluded.command_id, command_id),
+    place_id = COALESCE(excluded.place_id, place_id),
+    start_time = COALESCE(excluded.start_time, start_time);
+-- New entry: inserts all fields
+-- Placeholder exists: fills in missing fields, preserves exit_status/duration
+```
+
+**Why this matters:**
+- Network retries won't create duplicate history entries
+- Offline queue replay can be safely interrupted and resumed
+- Crash recovery is safe (just re-process the queue)
+- Partial replay safe (stops on first failure, resumes next scan)
+
+---
+
+
+## CLI Commands for Shell Integration
+
+The `histdb-cli` binary provides commands that all shells use for:
+- UUID generation (consistent UUIDv7 across shells)
+- Daemon communication (unified protocol)
+- Offline queue management (shared implementation)
+
+```rust
+// cli/main.rs
+
+#[derive(Parser)]
+#[command(name = "histdb-cli")]
+pub enum Command {
+    /// Generate a new UUIDv7 (for history_id, session_id)
+    Uuid,
+
+    /// Send message to daemon (returns exit code 0 on success, 1 on failure)
+    Send {
+        /// JSON message to send
+        message: String,
+    },
+
+    /// Queue message offline (when daemon unavailable)
+    Queue {
+        /// Message type: "start" or "finish"
+        msg_type: String,
+        /// JSON message to queue
+        message: String,
+    },
+
+    /// Process offline queue (called by daemon on startup)
+    ProcessQueue,
+
+    // ... other commands (query, forget, etc.)
+}
+
+/// Generate UUIDv7 - time-ordered, globally unique
+pub fn handle_uuid() {
+    println!("{}", Uuid::now_v7());
+}
+
+/// Send message to daemon - fire-and-forget with exit code
+pub fn handle_send(message: &str) -> Result<()> {
+    let socket_path = get_socket_path();
+
+    // Try to connect with short timeout
+    let stream = UnixStream::connect(&socket_path)
+        .map_err(|_| Error::DaemonUnavailable)?;
+    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+
+    let mut writer = BufWriter::new(&stream);
+    writeln!(writer, "{}", message)?;
+    writer.flush()?;
+
+    // Read response (fire-and-forget still gets ACK)
+    let mut reader = BufReader::new(&stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+
+    // Check response indicates success
+    if response.contains("Accepted") || response.contains("ok") {
+        Ok(())
+    } else {
+        Err(Error::DaemonRejected(response))
+    }
+}
+
+/// Queue message to disk spool for later replay
+pub fn handle_queue(msg_type: &str, message: &str) -> Result<()> {
+    let spool_dir = get_spool_dir()?;
+    std::fs::create_dir_all(&spool_dir)?;
+
+    // Generate unique filename with timestamp for ordering
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_micros();
+    let uuid = Uuid::now_v7();
+    let filename = format!("{:016x}-{}.json", timestamp, uuid);
+
+
+    // Create spool entry
+    let entry = SpoolEntry {
+        msg_type: msg_type.to_string(),
+        payload: message.to_string(),
+        queued_at: timestamp as i64,
+    };
+
+    // Atomic write: write to temp, then rename
+    let temp_path = spool_dir.join(format!(".tmp-{}", filename));
+    let final_path = spool_dir.join(&filename);
+
+    let mut file = File::create(&temp_path)?;
+    serde_json::to_writer(&mut file, &entry)?;
+    file.sync_all()?;  // Ensure durability
+
+    std::fs::rename(&temp_path, &final_path)?;
+
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct SpoolEntry {
+    msg_type: String,
+    payload: String,
+    queued_at: i64,
+}
+
+fn get_socket_path() -> PathBuf {
+    std::env::var("HISTDB_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| "/tmp".to_string());
+            let uid = unsafe { libc::getuid() };
+            PathBuf::from(format!("{}/histdb-{}.sock", runtime_dir, uid))
+        })
+}
+
+fn get_spool_dir() -> Result<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".local/share")
+        });
+    Ok(data_dir.join("histdb/spool"))
+}
+
+```
+
+
+## Session ID Generation
+
+Shells generate their own session IDs using **UUIDv7** — no daemon round-trip required.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    UUIDv7 Structure                              │
+├─────────────────────────────────────────────────────────────────┤
+│  48-bit timestamp (ms)  │  4-bit ver  │  12-bit random  │ ...  │
+│  ──────────────────────   ──────────   ────────────────         │
+│  Time-ordered for        Fixed "7"    Uniqueness even           │
+│  efficient queries                    across shells/hosts       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why UUIDv7:**
+- **Works with offline queue**: Shell generates ID without daemon
+- **Time-ordered**: Efficient for "most recent session" queries
+- **Zero coordination**: No daemon round-trip
+
+```rust
+// Shell generates on startup (or shell plugin)
+let session_id = Uuid::now_v7();
+
+// In ZSH plugin
+typeset -g HISTDB_SESSION=$(histdb-cli session-id)  # Generate UUIDv7 session ID
+```
